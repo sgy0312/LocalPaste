@@ -15,4 +15,5 @@
 # Clipboard data must stay on the local Mac
 /history.json
 /boards.json
+/settings.json
 /Images/

@@ -10,6 +10,20 @@ enum ClipboardEntryKind: String, Codable {
     case files
 }
 
+enum ClipboardRetention: Int, CaseIterable {
+    case oneDay = 1
+    case threeDays = 3
+    case fiveDays = 5
+    case oneWeek = 7
+
+    var title: String { self == .oneWeek ? "一周" : "\(rawValue) 天" }
+    var interval: TimeInterval { TimeInterval(rawValue) * 24 * 60 * 60 }
+}
+
+private struct ClipboardSettings: Codable {
+    let retentionDays: Int
+}
+
 struct ClipboardBoard: Codable, Identifiable, Equatable {
     var id: UUID
     var name: String
@@ -70,6 +84,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable {
 final class ClipboardStore: ObservableObject {
     @Published private(set) var entries: [ClipboardEntry] = []
     @Published private(set) var isPaused: Bool
+    @Published private(set) var retention: ClipboardRetention = .oneDay
     @Published private(set) var boards: [ClipboardBoard] = [
         ClipboardBoard(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, name: "常用内容")
     ]
@@ -78,8 +93,11 @@ final class ClipboardStore: ObservableObject {
     private let storageDirectory: URL
     private let historyURL: URL
     private let boardsURL: URL
+    private let settingsURL: URL
     private let imagesDirectory: URL
     private let shouldMonitor: Bool
+    private let currentDate: () -> Date
+    private var lastRetentionSweep: Date?
     private var monitorTimer: Timer?
     private var lastChangeCount: Int
     private let thumbnailCache = NSCache<NSString, NSImage>()
@@ -88,18 +106,25 @@ final class ClipboardStore: ObservableObject {
     private let maximumImageBytes = 10_000_000
     private let maximumImageStorageBytes = 200_000_000
 
-    init(storageDirectory: URL? = nil, shouldMonitor: Bool = true) {
+    init(storageDirectory: URL? = nil, shouldMonitor: Bool = true, now: @escaping () -> Date = { Date() }) {
         let base = storageDirectory ?? FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("LocalPaste", isDirectory: true)
         self.storageDirectory = base
         self.historyURL = base.appendingPathComponent("history.json")
         self.boardsURL = base.appendingPathComponent("boards.json")
+        self.settingsURL = base.appendingPathComponent("settings.json")
         self.imagesDirectory = base.appendingPathComponent("Images", isDirectory: true)
         self.shouldMonitor = shouldMonitor
+        self.currentDate = now
         self.isPaused = shouldMonitor && UserDefaults.standard.bool(forKey: "LocalPaste.isPaused")
         self.lastChangeCount = shouldMonitor ? NSPasteboard.general.changeCount : 0
         thumbnailCache.totalCostLimit = 48_000_000
+        if let data = try? Data(contentsOf: settingsURL),
+           let settings = try? JSONDecoder().decode(ClipboardSettings.self, from: data),
+           let saved = ClipboardRetention(rawValue: settings.retentionDays) {
+            retention = saved
+        }
 
         if let data = try? Data(contentsOf: boardsURL),
            let saved = try? JSONDecoder().decode([ClipboardBoard].self, from: data), !saved.isEmpty {
@@ -115,6 +140,39 @@ final class ClipboardStore: ObservableObject {
 
     var pinnedCount: Int { entries.filter(\.isPinned).count }
 
+    func setRetention(_ value: ClipboardRetention) {
+        guard value != retention else { return }
+        do {
+            try FileManager.default.createDirectory(at: storageDirectory, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: storageDirectory.path)
+            try JSONEncoder().encode(ClipboardSettings(retentionDays: value.rawValue)).write(to: settingsURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: settingsURL.path)
+        } catch {
+            notice = "无法保存保留时间设置"
+            return
+        }
+        retention = value
+        notice = "历史保留 \(value.title)，固定内容继续保留"
+        removeExpiredEntries()
+    }
+
+    @discardableResult
+    func removeExpiredEntries() -> Int {
+        let date = currentDate()
+        lastRetentionSweep = date
+        let expired = entries.filter { isExpired($0, at: date) }
+        guard !expired.isEmpty else { return 0 }
+        let identifiers = Set(expired.map(\.id))
+        entries.removeAll { identifiers.contains($0.id) }
+        expired.forEach { removeImage(for: $0) }
+        saveHistory()
+        return expired.count
+    }
+
+    private func isExpired(_ entry: ClipboardEntry, at date: Date) -> Bool {
+        !entry.isPinned && entry.createdAt <= date.addingTimeInterval(-retention.interval)
+    }
+
     func togglePaused() {
         isPaused.toggle()
         if shouldMonitor {
@@ -128,8 +186,13 @@ final class ClipboardStore: ObservableObject {
         guard let index = entries.firstIndex(where: { $0.id == entry.id }) else { return }
         entries[index].isPinned.toggle()
         entries[index].boardID = entries[index].isPinned ? boards.first?.id : nil
+        let isPinned = entries[index].isPinned
         saveHistory()
-        notice = entries[index].isPinned ? "已固定到常用内容" : "已取消固定"
+        notice = isPinned ? "已固定到常用内容" : "已取消固定"
+        if !isPinned {
+            removeExpiredEntries()
+            if !entries.contains(where: { $0.id == entry.id }) { notice = "已取消固定，记录已到期" }
+        }
     }
 
     @discardableResult
@@ -177,6 +240,12 @@ final class ClipboardStore: ObservableObject {
 
     @discardableResult
     func copy(_ entry: ClipboardEntry, to pasteboard: NSPasteboard = .general) -> Bool {
+        let storedEntry = entries.first { $0.id == entry.id } ?? entry
+        guard !isExpired(storedEntry, at: currentDate()) else {
+            removeExpiredEntries()
+            notice = "这条记录已到期"
+            return false
+        }
         let objects: [NSPasteboardWriting]
         switch entry.kind {
         case .text:
@@ -224,6 +293,12 @@ final class ClipboardStore: ObservableObject {
         if shouldMonitor && pasteboard.name == NSPasteboard.general.name {
             lastChangeCount = pasteboard.changeCount
         }
+        if let index = entries.firstIndex(where: { $0.id == storedEntry.id }) {
+            var reused = entries.remove(at: index)
+            reused.createdAt = currentDate()
+            entries.insert(reused, at: 0)
+            saveHistory()
+        }
         notice = "已复制，按 ⌘V 粘贴"
         return true
     }
@@ -266,7 +341,7 @@ final class ClipboardStore: ObservableObject {
         }
         let fingerprint = Self.fingerprint(data)
         insert(ClipboardEntry(
-            id: UUID(), createdAt: Date(), kind: .text, text: text,
+            id: UUID(), createdAt: currentDate(), kind: .text, text: text,
             imageFilename: nil, fileURLs: nil, fingerprint: fingerprint,
             isPinned: false, sourceApplication: source
         ))
@@ -279,6 +354,10 @@ final class ClipboardStore: ObservableObject {
     }
 
     private func checkClipboard() {
+        let date = currentDate()
+        if lastRetentionSweep == nil || date.timeIntervalSince(lastRetentionSweep!) >= 60 || date < lastRetentionSweep! {
+            removeExpiredEntries()
+        }
         let pasteboard = NSPasteboard.general
         guard pasteboard.changeCount != lastChangeCount else { return }
         lastChangeCount = pasteboard.changeCount
@@ -337,7 +416,7 @@ final class ClipboardStore: ObservableObject {
         guard !strings.isEmpty else { return }
         let data = Data(strings.joined(separator: "\n").utf8)
         insert(ClipboardEntry(
-            id: UUID(), createdAt: Date(), kind: .files, text: nil,
+            id: UUID(), createdAt: currentDate(), kind: .files, text: nil,
             imageFilename: nil, fileURLs: strings, fingerprint: Self.fingerprint(data),
             isPinned: false, sourceApplication: source
         ))
@@ -355,7 +434,7 @@ final class ClipboardStore: ObservableObject {
             try FileManager.default.createDirectory(at: imagesDirectory, withIntermediateDirectories: true)
             try data.write(to: imagesDirectory.appendingPathComponent(filename), options: .atomic)
             insert(ClipboardEntry(
-                id: id, createdAt: Date(), kind: .image, text: nil,
+                id: id, createdAt: currentDate(), kind: .image, text: nil,
                 imageFilename: filename, fileURLs: nil, fingerprint: Self.fingerprint(data),
                 isPinned: false, sourceApplication: source
             ))
@@ -365,6 +444,7 @@ final class ClipboardStore: ObservableObject {
     }
 
     private func insert(_ entry: ClipboardEntry) {
+        removeExpiredEntries()
         if let existingIndex = entries.firstIndex(where: { $0.kind == entry.kind && $0.fingerprint == entry.fingerprint }) {
             let existing = entries.remove(at: existingIndex)
             if existing.isPinned {
@@ -424,6 +504,7 @@ final class ClipboardStore: ObservableObject {
             case .files: return !(entry.fileURLs ?? []).isEmpty
             }
         }.sorted { $0.createdAt > $1.createdAt }
+        removeExpiredEntries()
         enforceEntryLimit()
         enforceImageStorageLimit()
     }

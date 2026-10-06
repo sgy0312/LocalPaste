@@ -3,10 +3,10 @@ import Carbon.HIToolbox
 import QuartzCore
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private lazy var store = ClipboardStore()
     private let panel = ClipboardShelfPanel(contentRect: NSRect(origin: .zero, size: ClipboardShelfController.panelSize),
-                                            styleMask: [.borderless], backing: .buffered, defer: false)
+                                            styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
     private var controller: ClipboardShelfController!
     private var statusItem: NSStatusItem!
     private var hotKey: EventHotKeyRef?
@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previousApplication: NSRunningApplication?
     private var transitionID = 0
     private var isClosing = false
+    private let widthPreference = "LocalPaste.panelWidth"
+    private let heightPreference = "LocalPaste.panelHeight"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -42,11 +44,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.level = .floating
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
+        panel.delegate = self
+        panel.minSize = ShelfPanelSizing.minimumSize
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         controller = ClipboardShelfController(store: store) { [weak self] in
             self?.closePanel()
         } onClose: { [weak self] in
             self?.closePanel()
+        } onResizeEnd: { [weak self] in
+            self?.rememberPanelSize()
+        } onResetSize: { [weak self] in
+            self?.resetPanelSize()
         }
         panel.contentViewController = controller
     }
@@ -76,9 +84,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
         var targetFrame = panel.frame
         if let screen {
-            let available = screen.visibleFrame
-            targetFrame = NSRect(x: available.minX + 16, y: available.minY + 16,
-                                 width: available.width - 32, height: ClipboardShelfController.panelSize.height)
+            configureSizeLimits(on: screen)
+            targetFrame = ShelfPanelSizing.presentationFrame(on: screen.visibleFrame, preferredSize: preferredPanelSize)
         }
         let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         panel.alphaValue = reduced ? 1 : 0
@@ -95,6 +102,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 panel.animator().setFrame(targetFrame, display: true)
             }
         }
+    }
+
+    private var preferredPanelSize: NSSize? {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: widthPreference) != nil,
+              defaults.object(forKey: heightPreference) != nil else { return nil }
+        return NSSize(width: defaults.double(forKey: widthPreference), height: defaults.double(forKey: heightPreference))
+    }
+
+    private func configureSizeLimits(on screen: NSScreen) {
+        let available = ShelfPanelSizing.availableFrame(on: screen.visibleFrame)
+        panel.minSize = NSSize(width: min(ShelfPanelSizing.minimumSize.width, available.width),
+                               height: min(ShelfPanelSizing.minimumSize.height, available.height))
+        panel.maxSize = available.size
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) { rememberPanelSize() }
+
+    private func rememberPanelSize() {
+        UserDefaults.standard.set(panel.frame.width, forKey: widthPreference)
+        UserDefaults.standard.set(panel.frame.height, forKey: heightPreference)
+    }
+
+    private func resetPanelSize() {
+        UserDefaults.standard.removeObject(forKey: widthPreference)
+        UserDefaults.standard.removeObject(forKey: heightPreference)
+        guard let screen = panel.screen ?? NSScreen.main else { return }
+        configureSizeLimits(on: screen)
+        let frame = ShelfPanelSizing.presentationFrame(on: screen.visibleFrame, preferredSize: nil)
+        panel.setFrame(frame, display: true)
     }
 
     private func closePanel() {

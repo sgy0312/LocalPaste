@@ -5,12 +5,18 @@ import Foundation
 enum LocalPasteMain {
     @MainActor
     static func main() {
-        if CommandLine.arguments.contains("--self-test") {
-            runSelfTest()
-            return
-        }
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
+        if CommandLine.arguments.contains("--ui-self-test") {
+            runSizingSelfTest()
+            return
+        }
+        if CommandLine.arguments.contains("--self-test") {
+            runSelfTest()
+            runSizingSelfTest()
+            runRetentionSelfTest()
+            return
+        }
         if let index = CommandLine.arguments.firstIndex(of: "--render-preview"),
            CommandLine.arguments.count > index + 1 {
             renderPreview(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]))
@@ -19,6 +25,214 @@ enum LocalPasteMain {
         let delegate = AppDelegate()
         application.delegate = delegate
         withExtendedLifetime(delegate) { application.run() }
+    }
+
+    @MainActor
+    private static func runRetentionSelfTest() {
+        let directory = temporaryDirectory("RetentionTest")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var clock = start
+        for retention in ClipboardRetention.allCases {
+            clock = start
+            let folder = directory.appendingPathComponent("\(retention.rawValue)")
+            let store = ClipboardStore(storageDirectory: folder, shouldMonitor: false, now: { clock })
+            expect(store.retention == .oneDay, "Retention must default to one day")
+            store.setRetention(retention)
+            store.recordText("固定的常用内容")
+            store.togglePin(store.entries[0])
+            store.recordText("普通历史")
+            let text = store.entries[0]
+            let file = folder.appendingPathComponent("原始文件.txt")
+            try! Data("原始文件不能因历史到期而被删除".utf8).write(to: file)
+            board.clearContents()
+            board.writeObjects([file as NSURL])
+            store.capture(from: board)
+            board.clearContents()
+            board.setData(samplePNG(), forType: NSPasteboard.PasteboardType("public.png"))
+            store.capture(from: board)
+            let image = store.entries[0]
+            let imageURL = store.imageURL(for: image)!
+            clock = start.addingTimeInterval(retention.interval - 1)
+            expect(store.removeExpiredEntries() == 0 && store.entries.count == 4,
+                   "History must remain until the exact retention boundary")
+            store.togglePaused()
+            clock = start.addingTimeInterval(retention.interval)
+            expect(store.removeExpiredEntries() == 3 && store.entries.count == 1 && store.entries[0].isPinned,
+                   "Expired ordinary history must be removed while paused; pins must survive")
+            expect(!FileManager.default.fileExists(atPath: imageURL.path) && FileManager.default.fileExists(atPath: file.path),
+                   "Expiration must remove image copies and preserve original files")
+            board.clearContents()
+            board.setString("保留当前剪贴板", forType: .string)
+            expect(!store.copy(text, to: board) && board.string(forType: .string) == "保留当前剪贴板",
+                   "Expired cards must not replace the current clipboard")
+            let reloaded = ClipboardStore(storageDirectory: folder, shouldMonitor: false, now: { clock })
+            expect(reloaded.retention == retention && reloaded.entries.count == 1,
+                   "Retention settings and cleanup must persist")
+            store.togglePin(store.entries[0])
+            expect(store.entries.isEmpty, "Unpinning already-expired content must clean it immediately")
+        }
+
+        clock = start
+        let shortening = ClipboardStore(storageDirectory: directory.appendingPathComponent("Shortening"), shouldMonitor: false, now: { clock })
+        shortening.setRetention(.oneWeek)
+        shortening.recordText("六天前的普通内容")
+        shortening.recordText("六天前的固定内容")
+        shortening.togglePin(shortening.entries[0])
+        clock = start.addingTimeInterval(6 * 24 * 60 * 60)
+        shortening.setRetention(.fiveDays)
+        expect(shortening.entries.count == 1 && shortening.entries[0].isPinned,
+               "Shortening retention must immediately clean ordinary history and preserve pins")
+        shortening.setRetention(.oneWeek)
+        expect(shortening.entries.count == 1, "Extending retention must not restore deleted history")
+
+        clock = start
+        let extending = ClipboardStore(storageDirectory: directory.appendingPathComponent("Extending"), shouldMonitor: false, now: { clock })
+        extending.recordText("延长保留时间")
+        clock = start.addingTimeInterval(12 * 60 * 60)
+        extending.setRetention(.threeDays)
+        clock = start.addingTimeInterval(2 * 24 * 60 * 60)
+        expect(extending.removeExpiredEntries() == 0, "Extending retention must keep unexpired history longer")
+        clock = start.addingTimeInterval(3 * 24 * 60 * 60)
+        expect(extending.removeExpiredEntries() == 1, "Extended history must expire at its new boundary")
+
+        clock = start
+        let renewal = ClipboardStore(storageDirectory: directory.appendingPathComponent("Renewal"), shouldMonitor: false, now: { clock })
+        renewal.recordText("重复复制刷新期限")
+        clock = start.addingTimeInterval(18 * 60 * 60)
+        renewal.recordText("重复复制刷新期限")
+        clock = start.addingTimeInterval(30 * 60 * 60)
+        expect(renewal.removeExpiredEntries() == 0 && renewal.entries.count == 1, "Recopying content must renew its lifetime without duplicates")
+        expect(renewal.copy(renewal.entries[0], to: board), "Copying a valid history card must succeed")
+        clock = start.addingTimeInterval(48 * 60 * 60)
+        expect(renewal.removeExpiredEntries() == 0, "Copying a history card must renew its lifetime")
+        clock = start.addingTimeInterval(54 * 60 * 60)
+        expect(renewal.removeExpiredEntries() == 1, "Renewed content must expire after one full day")
+
+        clock = start
+        let startupFolder = directory.appendingPathComponent("Startup")
+        let startup = ClipboardStore(storageDirectory: startupFolder, shouldMonitor: false, now: { clock })
+        startup.recordText("关闭应用期间到期的内容")
+        board.clearContents()
+        board.setData(samplePNG(), forType: NSPasteboard.PasteboardType("public.png"))
+        startup.capture(from: board)
+        let startupImageURL = startup.imageURL(for: startup.entries[0])!
+        clock = start.addingTimeInterval(ClipboardRetention.oneDay.interval)
+        let resumed = ClipboardStore(storageDirectory: startupFolder, shouldMonitor: false, now: { clock })
+        expect(resumed.entries.isEmpty && !FileManager.default.fileExists(atPath: startupImageURL.path),
+               "Startup must clean content that expired while the app was closed")
+        let persisted = try! JSONDecoder().decode([ClipboardEntry].self, from: Data(contentsOf: startupFolder.appendingPathComponent("history.json")))
+        expect(persisted.isEmpty, "Startup cleanup must also update the saved history")
+
+        try! Data("{\"retentionDays\":2}".utf8).write(to: startupFolder.appendingPathComponent("settings.json"))
+        let invalid = ClipboardStore(storageDirectory: startupFolder, shouldMonitor: false, now: { clock })
+        expect(invalid.retention == .oneDay, "Unsupported saved settings must fall back to one day")
+        print("LocalPaste retention self-test passed: 1/3/5/7 days, exact expiry, pins, image cleanup, original files, pause, persistence, setting changes, renewal, startup")
+    }
+
+    @MainActor
+    private static func runSizingSelfTest() {
+        let visible = NSRect(x: -1920, y: 40, width: 1920, height: 1040)
+        let available = ShelfPanelSizing.availableFrame(on: visible)
+        let frame = ShelfPanelSizing.presentationFrame(on: visible, preferredSize: NSSize(width: 900, height: 500))
+        expect(frame.size == NSSize(width: 900, height: 500) && frame.midX == available.midX && frame.minY == available.minY,
+               "Remembered size must stay centered on the active screen")
+        let large = ShelfPanelSizing.presentationFrame(on: visible, preferredSize: NSSize(width: 5000, height: 5000))
+        expect(large == available, "Oversized preferences must fit a smaller screen")
+        let invalid = ShelfPanelSizing.presentationFrame(on: visible, preferredSize: NSSize(width: CGFloat.nan, height: -1))
+        expect(invalid.width == available.width && invalid.height == ShelfPanelSizing.defaultSize.height,
+               "Invalid preferences must fall back safely")
+        let compactScreen = NSRect(x: 0, y: 0, width: 600, height: 340)
+        expect(ShelfPanelSizing.presentationFrame(on: compactScreen, preferredSize: nil) == ShelfPanelSizing.availableFrame(on: compactScreen),
+               "Small displays must remain usable")
+        let minimum = ShelfPanelSizing.resizedFrame(frame, translation: NSPoint(x: -2000, y: -2000),
+                                                    edges: [.right, .top], visibleFrame: visible)
+        expect(minimum.size == ShelfPanelSizing.minimumSize && minimum.origin == frame.origin,
+               "Resizing must preserve the opposite corner and minimum size")
+        let maximum = ShelfPanelSizing.resizedFrame(frame, translation: NSPoint(x: 5000, y: 5000),
+                                                    edges: [.right, .top], visibleFrame: visible)
+        expect(maximum.maxX == available.maxX && maximum.maxY == available.maxY,
+               "Resize gestures must stay within the screen")
+        let left = ShelfPanelSizing.resizedFrame(frame, translation: NSPoint(x: 5000, y: 0), edges: .left, visibleFrame: visible)
+        expect(left.width == ShelfPanelSizing.minimumSize.width && left.maxX == frame.maxX,
+               "Left-edge resizing must keep the right edge fixed")
+        let bottom = ShelfPanelSizing.resizedFrame(frame, translation: NSPoint(x: 0, y: 5000), edges: .bottom, visibleFrame: visible)
+        expect(bottom.height == ShelfPanelSizing.minimumSize.height && bottom.maxY == frame.maxY,
+               "Bottom-edge resizing must keep the top edge fixed")
+
+        let directory = temporaryDirectory("SizingTest")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ClipboardStore(storageDirectory: directory, shouldMonitor: false)
+        for index in 1..<8 { store.createBoard(named: "较长的固定分组\(index)") }
+        store.recordText(String(repeating: "调整尺寸后仍可浏览内容。", count: 45))
+        var resizeCompletions = 0
+        let controller = ClipboardShelfController(store: store, previewMode: true, onCopy: {}, onResizeEnd: { resizeCompletions += 1 })
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: ClipboardShelfController.panelSize),
+                              styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
+        window.contentViewController = controller
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        let all = descendants(controller.view)
+        let searchButton = all.compactMap { $0 as? NSButton }.first { $0.toolTip == "搜索剪贴板" }!
+        let overlay = all.compactMap { $0 as? ShelfResizeOverlay }.first!
+        let searchField = all.compactMap { $0 as? NSSearchField }.first!
+        for retention in ClipboardRetention.allCases {
+            let menu = controller.makeSettingsMenu()
+            let retentionMenu = menu.items.first { $0.title.hasPrefix("历史保留时间：") }!.submenu!
+            let choices = retentionMenu.items.filter { ClipboardRetention(rawValue: $0.tag) != nil }
+            expect(choices.map(\.tag) == [1, 3, 5, 7], "The settings menu must expose every requested retention option")
+            expect(choices.first(where: { $0.tag == store.retention.rawValue })?.state == .on,
+                   "The menu must mark the active retention setting")
+            let item = choices.first { $0.tag == retention.rawValue }!
+            expect(NSApp.sendAction(item.action!, to: item.target, from: item) && store.retention == retention,
+                   "Choosing a menu item must update retention")
+        }
+        store.setRetention(.oneDay)
+        for size in [NSSize(width: 640, height: 352), NSSize(width: 800, height: 440),
+                     NSSize(width: 1200, height: 352), NSSize(width: 1000, height: 620)] {
+            for searching in [false, true] {
+                if searchField.isHidden == searching { searchButton.performClick(nil) }
+                window.setContentSize(size)
+                window.contentView?.layoutSubtreeIfNeeded()
+                for _ in 0..<3 { controller.view.layoutSubtreeIfNeeded() }
+                expect(controller.view.bounds.size == size, "Content must follow window dimensions: requested \(size), actual \(controller.view.bounds.size), window \(window.frame)")
+                for button in all.compactMap({ $0 as? NSButton }).filter({
+                    ["搜索剪贴板", "新建固定分组", "筛选内容类型", "设置与管理"].contains($0.toolTip ?? "") || $0.title == "剪贴板"
+                }) {
+                    let rect = button.convert(button.bounds, to: controller.view)
+                    expect(controller.view.bounds.insetBy(dx: -1, dy: -1).contains(rect), "Toolbar controls must fit at every size")
+                    expect(overlay.hitTest(NSPoint(x: rect.midX, y: rect.midY)) == nil, "Resize handles must not steal toolbar clicks")
+                }
+                if searching {
+                    expect(controller.view.bounds.contains(searchField.convert(searchField.bounds, to: controller.view)),
+                           "Search must remain accessible in compact layouts")
+                }
+                expect(overlay.hitTest(NSPoint(x: size.width / 2, y: size.height / 2)) == nil,
+                       "The card area must remain interactive")
+                expect(overlay.hitTest(NSPoint(x: size.width - 20, y: 20)) === overlay,
+                       "The visible corner grip must receive resize gestures")
+                let card = descendants(controller.view).first { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true }!
+                expect(abs(card.frame.height - max(224, size.height - 128)) <= 1,
+                       "Cards must use the additional height instead of leaving a blank panel")
+            }
+        }
+        if let screen = NSScreen.main {
+            let initial = ShelfPanelSizing.presentationFrame(on: screen.visibleFrame, preferredSize: NSSize(width: 800, height: 400))
+            window.setFrame(initial, display: false)
+            controller.view.layoutSubtreeIfNeeded()
+            let location = NSPoint(x: initial.width / 2, y: initial.height - 3)
+            func event(_ type: NSEvent.EventType, at point: NSPoint) -> NSEvent {
+                NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+                                   windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            }
+            overlay.mouseDown(with: event(.leftMouseDown, at: location))
+            overlay.mouseDragged(with: event(.leftMouseDragged, at: NSPoint(x: location.x, y: location.y + 40)))
+            overlay.mouseUp(with: event(.leftMouseUp, at: location))
+            let expected = ShelfPanelSizing.resizedFrame(initial, translation: NSPoint(x: 0, y: 40), edges: .top, visibleFrame: screen.visibleFrame)
+            expect(window.frame == expected && resizeCompletions == 1, "A drag must resize the actual window and finish once")
+        }
+        print("LocalPaste UI self-test passed: screen limits, minimum size, responsive toolbar, search, hit testing, resize gestures")
     }
 
     @MainActor
@@ -128,7 +342,13 @@ enum LocalPasteMain {
         store.notice = nil
 
         let controller = ClipboardShelfController(store: store, previewMode: true, onCopy: {})
-        let window = NSWindow(contentRect: NSRect(origin: .zero, size: ClipboardShelfController.panelSize),
+        var size = ClipboardShelfController.panelSize
+        if let index = CommandLine.arguments.firstIndex(of: "--size"), CommandLine.arguments.count > index + 2,
+           let width = Double(CommandLine.arguments[index + 1]), let height = Double(CommandLine.arguments[index + 2]),
+           width.isFinite, height.isFinite, width >= ShelfPanelSizing.minimumSize.width, height >= ShelfPanelSizing.minimumSize.height {
+            size = NSSize(width: width, height: height)
+        }
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         if CommandLine.arguments.contains("--dark") {
             window.appearance = NSAppearance(named: .darkAqua)
@@ -136,6 +356,7 @@ enum LocalPasteMain {
             window.appearance = NSAppearance(named: .aqua)
         }
         window.contentViewController = controller
+        window.setContentSize(size)
         window.contentView?.layoutSubtreeIfNeeded()
         controller.view.layoutSubtreeIfNeeded()
         if CommandLine.arguments.contains("--layout") { reportLayout(controller.view) }

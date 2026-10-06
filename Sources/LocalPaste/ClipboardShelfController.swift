@@ -38,10 +38,12 @@ private enum ShelfMotion {
 
 @MainActor
 final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
-    static let panelSize = NSSize(width: 1200, height: 352)
+    static let panelSize = ShelfPanelSizing.defaultSize
     private let store: ClipboardStore
     private let onCopy: () -> Void
     private let onClose: () -> Void
+    private let onResizeEnd: () -> Void
+    private let onResetSize: () -> Void
     private let previewMode: Bool
     private let searchField = NSSearchField()
     private let searchButton = ShelfIconButton()
@@ -49,10 +51,14 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
     private let tabs = NSStackView()
     private let tabScroll = NSScrollView()
     private var tabWidth: NSLayoutConstraint!
+    private var searchWidth: NSLayoutConstraint!
+    private var tabDocumentWidth: CGFloat = 108
     private let typeButton = ShelfIconButton()
     private let menuButton = ShelfIconButton()
     private let statusLabel = ShelfTextField(labelWithString: "")
+    private let privacyLabel = ShelfTextField(labelWithString: "")
     private let countLabel = ShelfTextField(labelWithString: "")
+    private let keyboardHint = ShelfTextField(labelWithString: "← → 选择   回车复制   esc 关闭")
     private let scrollView = HorizontalHistoryScrollView()
     private let strip = ClipboardStripView()
     private let welcome = NSView()
@@ -69,11 +75,14 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
     private var showWelcome: Bool
     private var observation: AnyCancellable?
 
-    init(store: ClipboardStore, previewMode: Bool = false, onCopy: @escaping () -> Void, onClose: @escaping () -> Void = {}) {
+    init(store: ClipboardStore, previewMode: Bool = false, onCopy: @escaping () -> Void,
+         onClose: @escaping () -> Void = {}, onResizeEnd: @escaping () -> Void = {}, onResetSize: @escaping () -> Void = {}) {
         self.store = store
         self.previewMode = previewMode
         self.onCopy = onCopy
         self.onClose = onClose
+        self.onResizeEnd = onResizeEnd
+        self.onResetSize = onResetSize
         self.showWelcome = previewMode || !UserDefaults.standard.bool(forKey: "LocalPaste.welcomeDismissed")
         super.init(nibName: nil, bundle: nil)
         observation = store.objectWillChange.sink { [weak self] _ in
@@ -85,6 +94,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
 
     override func loadView() {
         let root = ClipboardShelfBackdrop(frame: NSRect(origin: .zero, size: Self.panelSize))
+        root.autoresizingMask = [.width, .height]
         root.isPreview = previewMode
         root.material = .popover
         root.blendingMode = .behindWindow
@@ -96,6 +106,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         root.layer?.borderWidth = 1
         root.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.14).cgColor
         root.keyHandler = { [weak self] event in self?.handleKey(event) ?? false }
+        root.layoutHandler = { [weak self] in self?.layoutContents() }
 
         let stack = NSStackView()
         stack.orientation = .vertical
@@ -112,6 +123,10 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         stack.addArrangedSubview(makeToolbar())
         stack.addArrangedSubview(makeHistory())
         stack.addArrangedSubview(makeFooter())
+        let resize = ShelfResizeOverlay(frame: root.bounds)
+        resize.autoresizingMask = [.width, .height]
+        resize.onResizeEnd = onResizeEnd
+        root.addSubview(resize)
         view = root
         refresh()
     }
@@ -123,6 +138,12 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
 
     override func viewDidLayout() {
         super.viewDidLayout()
+        layoutContents()
+    }
+
+    private func layoutContents() {
+        updateResponsiveChrome()
+        scrollView.layoutSubtreeIfNeeded()
         let size = scrollView.contentSize
         if size.width > 0 && size.height > 0 && size != stripSize { rebuildHistory() }
     }
@@ -130,6 +151,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
     func focusInput() { view.window?.makeFirstResponder(searchVisible ? searchField : view) }
 
     func prepareForPresentation() {
+        store.removeExpiredEntries()
         refresh()
         cards.forEach { $0.refreshTimestamp() }
     }
@@ -180,7 +202,8 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         searchField.sendsSearchStringImmediately = true
         searchField.controlSize = .small
         searchField.translatesAutoresizingMaskIntoConstraints = false
-        searchField.widthAnchor.constraint(equalToConstant: 190).isActive = true
+        searchWidth = searchField.widthAnchor.constraint(equalToConstant: 190)
+        searchWidth.isActive = true
         searchField.isHidden = true
 
         tabs.orientation = .horizontal
@@ -192,7 +215,9 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         tabScroll.documentView = tabs
         tabScroll.translatesAutoresizingMaskIntoConstraints = false
         tabWidth = tabScroll.widthAnchor.constraint(equalToConstant: 108)
-        NSLayoutConstraint.activate([tabWidth, tabScroll.heightAnchor.constraint(equalToConstant: 38)])
+        tabWidth.priority = .defaultLow
+        NSLayoutConstraint.activate([tabWidth, tabScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 1),
+                                     tabScroll.heightAnchor.constraint(equalToConstant: 38)])
 
         let add = ShelfIconButton()
         configureIcon(add, symbol: "plus", help: "新建固定分组", action: #selector(createBoard))
@@ -207,8 +232,10 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         center.detachesHiddenViews = true
         center.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(center)
+        let centering = center.centerXAnchor.constraint(equalTo: container.centerXAnchor)
+        centering.priority = .defaultHigh
         NSLayoutConstraint.activate([
-            center.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            centering,
             center.centerYAnchor.constraint(equalTo: container.centerYAnchor),
             center.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: 16),
             center.trailingAnchor.constraint(lessThanOrEqualTo: menuButton.leadingAnchor, constant: -16),
@@ -291,22 +318,26 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
 
     private func makeFooter() -> NSView {
         let container = fixedHeight(34)
-        let privacy = label("●  仅存本机", size: 10, color: .secondaryLabelColor)
+        privacyLabel.font = .systemFont(ofSize: 10)
+        privacyLabel.textColor = .secondaryLabelColor
         statusLabel.font = .systemFont(ofSize: 10)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
         countLabel.font = .systemFont(ofSize: 10)
         countLabel.textColor = .secondaryLabelColor
-        let hint = label("← → 选择   回车复制   esc 关闭", size: 10, color: .secondaryLabelColor)
-        let row = NSStackView(views: [privacy, statusLabel, NSView(), countLabel, hint])
+        keyboardHint.font = .systemFont(ofSize: 10)
+        keyboardHint.textColor = .secondaryLabelColor
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [privacyLabel, statusLabel, NSView(), countLabel, keyboardHint])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 16
+        row.detachesHiddenViews = true
         row.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(row)
         NSLayoutConstraint.activate([
             row.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 24),
-            row.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -24),
+            row.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -44),
             row.centerYAnchor.constraint(equalTo: container.centerYAnchor)
         ])
         return container
@@ -320,6 +351,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
             styleTab(button, selected: store.boards[index].id == selectedBoardID)
         }
         statusLabel.stringValue = store.notice ?? (store.isPaused ? "记录已暂停" : "输入即可搜索")
+        privacyLabel.stringValue = "●  仅存本机 · 保留 \(store.retention.title)"
         typeButton.contentTintColor = selectedType == 0 ? .secondaryLabelColor : .systemBlue
         rebuildHistory()
     }
@@ -348,8 +380,23 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         }
         let width = max(1, x - 10)
         tabs.frame = NSRect(x: 0, y: 0, width: width, height: 38)
-        tabWidth.constant = min(width, searchVisible ? 260 : 440)
+        tabDocumentWidth = width
+        updateResponsiveChrome()
         knownBoards = store.boards
+    }
+
+    private func updateResponsiveChrome() {
+        guard isViewLoaded, tabWidth != nil, searchWidth != nil else { return }
+        let width = view.bounds.width
+        let search = min(190, max(160, width - 480))
+        if searchWidth.constant != search { searchWidth.constant = search }
+        // Leave space for the fixed controls, gaps, and the menu at the right edge.
+        let fixedWidth: CGFloat = 232 + (searchVisible ? search + 10 : 0)
+        let availableTabs = max(1, width - 84 - fixedWidth)
+        let tabsWidth = min(tabDocumentWidth, searchVisible ? 260 : 440, availableTabs)
+        if tabWidth.constant != tabsWidth { tabWidth.constant = tabsWidth }
+        welcome.isHidden = !showWelcome || width < 880
+        keyboardHint.isHidden = width < 780
     }
 
     private func rebuildHistory() {
@@ -395,8 +442,8 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
     }
 
     private func layoutHistory(preserving scrollX: CGFloat) {
-        let width = ShelfGeometry.cardWidth
-        let height = ShelfGeometry.cardHeight
+        let height = max(ShelfGeometry.cardHeight, stripSize.height - 30)
+        let width = min(340, ShelfGeometry.cardWidth + (height - ShelfGeometry.cardHeight) * 0.25)
         let gap = ShelfGeometry.gap
         let y = max(14, (stripSize.height - height) / 2)
         for (index, card) in cards.enumerated() {
@@ -470,7 +517,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         searchVisible.toggle()
         searchField.isHidden = !searchVisible
         if !searchVisible { searchField.stringValue = ""; selectedID = nil }
-        tabWidth.constant = min(tabs.frame.width, searchVisible ? 260 : 440)
+        updateResponsiveChrome()
         view.layoutSubtreeIfNeeded()
         rebuildHistory()
         focusInput()
@@ -532,18 +579,41 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
     }
 
     @objc private func showSettingsMenu() {
+        let menu = makeSettingsMenu()
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: menuButton.bounds.minY), in: menuButton)
+    }
+
+    func makeSettingsMenu() -> NSMenu {
         let menu = NSMenu()
         let title = menu.addItem(withTitle: "本地剪贴板 · 仅存本机", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(.separator())
         addItem(menu, store.isPaused ? "恢复记录" : "暂停记录", #selector(togglePause))
+        let retentionItem = menu.addItem(withTitle: "历史保留时间：\(store.retention.title)", action: nil, keyEquivalent: "")
+        let retentionMenu = NSMenu(title: "历史保留时间")
+        for value in ClipboardRetention.allCases {
+            let item = retentionMenu.addItem(withTitle: value == .oneDay ? "1 天（默认）" : value.title,
+                                            action: #selector(selectRetention(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = value.rawValue
+            item.state = store.retention == value ? .on : .off
+        }
+        retentionMenu.addItem(.separator())
+        retentionMenu.addItem(withTitle: "固定内容继续保留", action: nil, keyEquivalent: "").isEnabled = false
+        retentionItem.submenu = retentionMenu
         addItem(menu, "新建固定分组…", #selector(createBoard))
+        addItem(menu, "恢复默认大小", #selector(resetPanelSize))
         addItem(menu, "清空历史…", #selector(confirmClear))
         menu.addItem(.separator())
         addItem(menu, "退出本地剪贴板", #selector(quitApp))
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: menuButton.bounds.minY), in: menuButton)
+        return menu
     }
     @objc private func togglePause() { store.togglePaused() }
+    @objc private func selectRetention(_ sender: NSMenuItem) {
+        if let value = ClipboardRetention(rawValue: sender.tag) { store.setRetention(value) }
+        refresh()
+    }
+    @objc private func resetPanelSize() { onResetSize() }
     @objc private func quitApp() { NSApp.terminate(nil) }
     @objc private func confirmClear() {
         let alert = NSAlert()
@@ -617,6 +687,8 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
 private final class ClipboardShelfBackdrop: NSVisualEffectView {
     var isPreview = false
     var keyHandler: ((NSEvent) -> Bool)?
+    var layoutHandler: (() -> Void)?
+    override func layout() { super.layout(); layoutHandler?() }
     override var acceptsFirstResponder: Bool { true }
     override func keyDown(with event: NSEvent) {
         if keyHandler?(event) != true { super.keyDown(with: event) }
@@ -708,6 +780,7 @@ private final class ClipboardShelfCard: NSView {
     private let onCopy: () -> Void
     private let animationsEnabled: Bool
     private let headerLabel = ShelfTextField(labelWithString: "")
+    private var bodyLabel: NSTextField?
     private var tracking: NSTrackingArea?
     private var isHovered = false
     var isSelected = false { didSet { if isSelected != oldValue { updateColors(animated: true) } } }
@@ -718,6 +791,7 @@ private final class ClipboardShelfCard: NSView {
         self.onCopy = onCopy
         self.animationsEnabled = animationsEnabled
         super.init(frame: .zero)
+        identifier = NSUserInterfaceItemIdentifier("clipboard-card-\(entry.id)")
         wantsLayer = true
         layer?.cornerRadius = ShelfGeometry.cardRadius
         layer?.cornerCurve = .continuous
@@ -741,6 +815,10 @@ private final class ClipboardShelfCard: NSView {
         layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: ShelfGeometry.cardRadius,
                                   cornerHeight: ShelfGeometry.cardRadius, transform: nil)
         CATransaction.commit()
+        if let bodyLabel, entry.linkURL == nil {
+            let lines = max(7, Int((bounds.height - 110) / 16))
+            if bodyLabel.maximumNumberOfLines != lines { bodyLabel.maximumNumberOfLines = lines }
+        }
     }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -851,6 +929,7 @@ private final class ClipboardShelfCard: NSView {
             let text = NSTextField(wrappingLabelWithString: String((entry.linkURL?.host ?? entry.preview).prefix(650)))
             text.font = .systemFont(ofSize: entry.linkURL != nil ? 17 : 13, weight: entry.linkURL != nil ? .semibold : .regular)
             text.maximumNumberOfLines = entry.linkURL == nil ? 7 : 2
+            bodyLabel = text
             text.lineBreakMode = .byTruncatingTail
             text.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(text)
