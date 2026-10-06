@@ -1,0 +1,157 @@
+import AppKit
+import Carbon.HIToolbox
+import QuartzCore
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private lazy var store = ClipboardStore()
+    private let panel = ClipboardShelfPanel(contentRect: NSRect(origin: .zero, size: ClipboardShelfController.panelSize),
+                                            styleMask: [.borderless], backing: .buffered, defer: false)
+    private var controller: ClipboardShelfController!
+    private var statusItem: NSStatusItem!
+    private var hotKey: EventHotKeyRef?
+    private var eventHandler: EventHandlerRef?
+    private var previousApplication: NSRunningApplication?
+    private var transitionID = 0
+    private var isClosing = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        setupPanel()
+        setupStatusItem()
+        registerGlobalShortcut()
+        DispatchQueue.main.async { self.showPanel() }
+    }
+
+    func applicationDidResignActive(_ notification: Notification) {
+        if NSApp.modalWindow == nil, !isClosing {
+            transitionID += 1
+            panel.orderOut(nil)
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let hotKey { UnregisterEventHotKey(hotKey) }
+        if let eventHandler { RemoveEventHandler(eventHandler) }
+    }
+
+    private func setupPanel() {
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        controller = ClipboardShelfController(store: store) { [weak self] in
+            self?.closePanel()
+        } onClose: { [weak self] in
+            self?.closePanel()
+        }
+        panel.contentViewController = controller
+    }
+
+    private func setupStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        guard let button = statusItem.button else { return }
+        button.image = NSImage(systemSymbolName: "clipboard", accessibilityDescription: "本地剪贴板")
+        button.toolTip = "本地剪贴板 · ⌘⇧V"
+        button.target = self
+        button.action = #selector(togglePanel)
+    }
+
+    @objc private func togglePanel() {
+        if panel.isVisible && !isClosing { closePanel() } else { showPanel() }
+    }
+
+    private func showPanel() {
+        guard !panel.isVisible || isClosing else { return }
+        transitionID += 1
+        isClosing = false
+        panel.ignoresMouseEvents = false
+        if let front = NSWorkspace.shared.frontmostApplication,
+           front.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            previousApplication = front
+        }
+        let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
+        var targetFrame = panel.frame
+        if let screen {
+            let available = screen.visibleFrame
+            targetFrame = NSRect(x: available.minX + 16, y: available.minY + 16,
+                                 width: available.width - 32, height: ClipboardShelfController.panelSize.height)
+        }
+        let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        panel.alphaValue = reduced ? 1 : 0
+        panel.setFrame(reduced ? targetFrame : targetFrame.offsetBy(dx: 0, dy: -12), display: false)
+        controller.prepareForPresentation()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        controller.focusInput()
+        if !reduced {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.20
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                panel.animator().alphaValue = 1
+                panel.animator().setFrame(targetFrame, display: true)
+            }
+        }
+    }
+
+    private func closePanel() {
+        guard panel.isVisible, !isClosing else { return }
+        transitionID += 1
+        let token = transitionID
+        isClosing = true
+        panel.ignoresMouseEvents = true
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            panel.orderOut(nil)
+            isClosing = false
+            panel.ignoresMouseEvents = false
+        } else {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.12
+                context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                panel.animator().alphaValue = 0
+                panel.animator().setFrame(panel.frame.offsetBy(dx: 0, dy: -6), display: true)
+            } completionHandler: { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self, self.transitionID == token else { return }
+                    self.panel.orderOut(nil)
+                    self.isClosing = false
+                    self.panel.ignoresMouseEvents = false
+                    self.panel.alphaValue = 1
+                }
+            }
+        }
+        previousApplication?.activate(options: [])
+    }
+
+    private func registerGlobalShortcut() {
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let handler: EventHandlerProcPtr = { _, _, userData in
+            guard let userData else { return noErr }
+            let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+            DispatchQueue.main.async { delegate.togglePanel() }
+            return noErr
+        }
+        let handlerStatus = InstallEventHandler(
+            GetApplicationEventTarget(), handler, 1, &eventType,
+            Unmanaged.passUnretained(self).toOpaque(), &eventHandler
+        )
+        guard handlerStatus == noErr else {
+            store.notice = "快捷键暂不可用，请点击菜单栏图标"
+            return
+        }
+        let identifier = EventHotKeyID(signature: OSType(0x4C505354), id: 1)
+        let shortcutStatus = RegisterEventHotKey(
+            UInt32(kVK_ANSI_V), UInt32(shiftKey | cmdKey), identifier,
+            GetApplicationEventTarget(), 0, &hotKey
+        )
+        if shortcutStatus != noErr { store.notice = "⌘⇧V 已被占用，请点击菜单栏图标" }
+    }
+}
+
+private final class ClipboardShelfPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}

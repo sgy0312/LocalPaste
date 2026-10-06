@@ -1,0 +1,18 @@
+# Generated app bundles, previews, and compiler caches
+/build/
+/.build/
+/.swiftpm/
+
+# Local macOS files
+.DS_Store
+*.xcuserstate
+
+# Local environment configuration
+.env
+.env.*
+!.env.example
+
+# Clipboard data must stay on the local Mac
+/history.json
+/boards.json
+/Images/
