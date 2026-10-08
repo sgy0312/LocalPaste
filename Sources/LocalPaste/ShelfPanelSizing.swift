@@ -8,6 +8,26 @@ struct ShelfResizeEdges: OptionSet {
     static let top = Self(rawValue: 1 << 3)
 }
 
+enum ShelfPanelPreset: String, CaseIterable {
+    case compact, standard, wide
+
+    var title: String {
+        switch self {
+        case .compact: return "紧凑 · 640 × 352"
+        case .standard: return "标准 · 900 × 400"
+        case .wide: return "宽大 · 1200 × 352"
+        }
+    }
+
+    var size: NSSize {
+        switch self {
+        case .compact: return NSSize(width: 640, height: 352)
+        case .standard: return NSSize(width: 900, height: 400)
+        case .wide: return NSSize(width: 1200, height: 352)
+        }
+    }
+}
+
 enum ShelfPanelSizing {
     static let defaultSize = NSSize(width: 1200, height: 352)
     static let minimumSize = NSSize(width: 640, height: 352)

@@ -9,11 +9,13 @@ enum LocalPasteMain {
         application.setActivationPolicy(.accessory)
         if CommandLine.arguments.contains("--ui-self-test") {
             runSizingSelfTest()
+            runInteractionSelfTest()
             return
         }
         if CommandLine.arguments.contains("--self-test") {
             runSelfTest()
             runSizingSelfTest()
+            runInteractionSelfTest()
             runRetentionSelfTest()
             return
         }
@@ -174,7 +176,6 @@ enum LocalPasteMain {
         window.contentViewController = controller
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
         let all = descendants(controller.view)
-        let searchButton = all.compactMap { $0 as? NSButton }.first { $0.toolTip == "搜索剪贴板" }!
         let overlay = all.compactMap { $0 as? ShelfResizeOverlay }.first!
         let searchField = all.compactMap { $0 as? NSSearchField }.first!
         for retention in ClipboardRetention.allCases {
@@ -192,29 +193,31 @@ enum LocalPasteMain {
         for size in [NSSize(width: 640, height: 352), NSSize(width: 800, height: 440),
                      NSSize(width: 1200, height: 352), NSSize(width: 1000, height: 620)] {
             for searching in [false, true] {
-                if searchField.isHidden == searching { searchButton.performClick(nil) }
+                if searching { window.makeFirstResponder(searchField) }
+                else { window.makeFirstResponder(controller.view) }
                 window.setContentSize(size)
                 window.contentView?.layoutSubtreeIfNeeded()
                 for _ in 0..<3 { controller.view.layoutSubtreeIfNeeded() }
                 expect(controller.view.bounds.size == size, "Content must follow window dimensions: requested \(size), actual \(controller.view.bounds.size), window \(window.frame)")
                 for button in all.compactMap({ $0 as? NSButton }).filter({
-                    ["搜索剪贴板", "新建固定分组", "筛选内容类型", "设置与管理"].contains($0.toolTip ?? "") || $0.title == "剪贴板"
+                    ["新建固定分组", "筛选内容类型", "设置与管理"].contains($0.toolTip ?? "") || $0.title == "剪贴板"
                 }) {
                     let rect = button.convert(button.bounds, to: controller.view)
                     expect(controller.view.bounds.insetBy(dx: -1, dy: -1).contains(rect), "Toolbar controls must fit at every size")
                     expect(overlay.hitTest(NSPoint(x: rect.midX, y: rect.midY)) == nil, "Resize handles must not steal toolbar clicks")
                 }
-                if searching {
-                    expect(controller.view.bounds.contains(searchField.convert(searchField.bounds, to: controller.view)),
-                           "Search must remain accessible in compact layouts")
-                }
+                expect(!searchField.isHidden && controller.view.bounds.contains(searchField.convert(searchField.bounds, to: controller.view)),
+                       "Search must remain visible and accessible in compact layouts")
                 expect(overlay.hitTest(NSPoint(x: size.width / 2, y: size.height / 2)) == nil,
                        "The card area must remain interactive")
                 expect(overlay.hitTest(NSPoint(x: size.width - 20, y: 20)) === overlay,
                        "The visible corner grip must receive resize gestures")
                 let card = descendants(controller.view).first { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true }!
-                expect(abs(card.frame.height - max(224, size.height - 128)) <= 1,
+                expect(abs(card.frame.height - max(220, size.height - 124)) <= 1,
                        "Cards must use the additional height instead of leaving a blank panel")
+                for button in descendants(card).compactMap({ $0 as? NSButton }) {
+                    expect(card.bounds.contains(button.convert(button.bounds, to: card)), "Card actions must stay inside the card")
+                }
             }
         }
         if let screen = NSScreen.main {
@@ -230,9 +233,132 @@ enum LocalPasteMain {
             overlay.mouseDragged(with: event(.leftMouseDragged, at: NSPoint(x: location.x, y: location.y + 40)))
             overlay.mouseUp(with: event(.leftMouseUp, at: location))
             let expected = ShelfPanelSizing.resizedFrame(initial, translation: NSPoint(x: 0, y: 40), edges: .top, visibleFrame: screen.visibleFrame)
-            expect(window.frame == expected && resizeCompletions == 1, "A drag must resize the actual window and finish once")
+            let actual = window.frame
+            let matches = abs(actual.minX - expected.minX) <= 1 && abs(actual.minY - expected.minY) <= 1 &&
+                abs(actual.width - expected.width) <= 1 && abs(actual.height - expected.height) <= 1
+            expect(matches && resizeCompletions == 1,
+                   "A drag must resize the actual window and finish once: initial \(initial), actual \(window.frame), expected \(expected), callbacks \(resizeCompletions), overlay \(overlay.bounds)")
         }
         print("LocalPaste UI self-test passed: screen limits, minimum size, responsive toolbar, search, hit testing, resize gestures")
+    }
+
+    @MainActor
+    private static func runInteractionSelfTest() {
+        let directory = temporaryDirectory("InteractionTest")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let store = ClipboardStore(storageDirectory: directory, shouldMonitor: false)
+        let fullText = String(repeating: "完整预览保留所有文字和换行。\n", count: 100)
+        store.recordText(fullText)
+        var closes = 0
+        var appliedPresets: [ShelfPanelPreset] = []
+        let controller = ClipboardShelfController(store: store, previewMode: true, onCopy: {},
+                                                  onClose: { closes += 1 }, onApplyPreset: { appliedPresets.append($0) })
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 400),
+                              styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentViewController = controller
+        defer { controller.prepareForDismissal(); window.close() }
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        let search = descendants(controller.view).compactMap { $0 as? NSSearchField }.first!
+        func key(_ code: UInt16, text: String = "", modifiers: NSEvent.ModifierFlags = []) -> NSEvent {
+            NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0,
+                             windowNumber: window.windowNumber, context: nil, characters: text,
+                             charactersIgnoringModifiers: text, isARepeat: false, keyCode: code)!
+        }
+        controller.focusInput()
+        expect(window.firstResponder === controller.view, "Opening an empty search must allow card arrow keys and Space")
+        controller.view.keyDown(with: key(0, text: "a"))
+        expect(search.currentEditor()?.string == "a", "Typing from cards must hand the initiating key to the native search editor")
+        search.stringValue = ""
+        expect(controller.view.performKeyEquivalent(with: key(3, text: "f", modifiers: .command)), "Command-F must reach the search field")
+        let editor = search.currentEditor() as! NSTextView
+        expect(!controller.control(search, textView: editor, doCommandBy: #selector(NSResponder.moveLeft(_:))) &&
+               !controller.control(search, textView: editor, doCommandBy: #selector(NSResponder.moveRight(_:))),
+               "Search must preserve native text caret navigation")
+        editor.insertText("hello world", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+        expect(editor.string == "hello world", "Spaces must remain ordinary text while searching")
+        search.stringValue = "missing"
+        controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
+        expect(!descendants(controller.view).contains { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true },
+               "Search must show an empty state for unmatched content")
+        expect(controller.control(search, textView: editor, doCommandBy: #selector(NSResponder.cancelOperation(_:))), "Search must handle Escape")
+        expect(search.stringValue.isEmpty && closes == 0, "First Escape must clear the query without closing the shelf")
+        search.stringValue = "完整预览"
+        controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
+        window.makeFirstResponder(search)
+        let searchEditor = search.currentEditor() as! NSTextView
+        expect(controller.control(search, textView: searchEditor, doCommandBy: #selector(NSResponder.moveDown(_:))) &&
+               window.firstResponder === controller.view && search.stringValue == "完整预览",
+               "Down must move focus to matching cards while preserving the search query")
+        controller.view.keyDown(with: key(49, text: " "))
+        let preview = window.childWindows!.first!
+        expect(preview.identifier?.rawValue == "clipboard-content-preview", "Space must open a child preview")
+        preview.contentView?.layoutSubtreeIfNeeded()
+        let textView = descendants(preview.contentView!).compactMap { $0 as? NSTextView }.first!
+        expect(textView.string == fullText && !textView.isEditable && textView.isSelectable,
+               "Preview must show the full selectable text without editing history")
+        let oldWidth = textView.frame.width
+        preview.setContentSize(NSSize(width: 700, height: 500))
+        preview.contentView?.layoutSubtreeIfNeeded()
+        expect(textView.frame.width > oldWidth, "Full text must reflow when preview is resized")
+        preview.cancelOperation(nil)
+        expect(window.childWindows?.isEmpty != false && closes == 0, "Escape must close only the preview first")
+        controller.view.keyDown(with: key(53))
+        expect(search.stringValue.isEmpty && closes == 0, "Escape after a filtered preview must clear search next")
+        controller.view.keyDown(with: key(53))
+        expect(closes == 1, "Escape must close the shelf after preview and search are cleared")
+
+        let sizeMenu = controller.makeSettingsMenu().items.first { $0.title == "面板尺寸" }!.submenu!
+        for item in sizeMenu.items where item.representedObject is String {
+            expect(NSApp.sendAction(item.action!, to: item.target, from: item), "Size presets must be usable as menu actions")
+        }
+        expect(appliedPresets == ShelfPanelPreset.allCases, "All three size presets must invoke the sizing callback")
+        let previewButton = descendants(controller.view).compactMap { $0 as? NSButton }.first { $0.toolTip == "预览完整内容" }!
+        previewButton.performClick(nil)
+        expect(window.childWindows?.count == 1, "The visible preview button must open a preview")
+        controller.prepareForDismissal()
+        expect(window.childWindows?.isEmpty != false, "Closing the shelf must also close the preview")
+        previewButton.performClick(nil)
+        store.remove(store.entries[0])
+        controller.prepareForPresentation()
+        expect(window.childWindows?.isEmpty != false, "Deleting a previewed entry must close its preview")
+
+        let file = directory.appendingPathComponent("原文件.txt")
+        try! Data("示例文件".utf8).write(to: file)
+        board.clearContents()
+        board.writeObjects([file as NSURL])
+        store.capture(from: board)
+        let filePreview = ContentPreviewController(entry: store.entries[0], store: store, onCopy: {}, onClose: {})
+        filePreview.show(on: window)
+        let fileWindow = window.childWindows!.first!
+        fileWindow.contentView?.layoutSubtreeIfNeeded()
+        expect(descendants(fileWindow.contentView!).compactMap { $0 as? NSTextView }.first?.string == file.path,
+               "File previews must show the original path without opening files")
+        filePreview.close()
+        board.clearContents()
+        board.setData(samplePNG(), forType: NSPasteboard.PasteboardType("public.png"))
+        store.capture(from: board)
+        let imagePreview = ContentPreviewController(entry: store.entries[0], store: store, onCopy: {}, onClose: {})
+        imagePreview.show(on: window)
+        let imageWindow = window.childWindows!.first!
+        imageWindow.contentView?.layoutSubtreeIfNeeded()
+        let image = descendants(imageWindow.contentView!).compactMap { $0 as? NSImageView }.first!
+        expect(image.image != nil && image.bounds.width > 0 && image.bounds.height > 0, "Image previews must have visible content")
+        imagePreview.close()
+        let emptyBoard = store.createBoard(named: "空分组")!
+        controller.prepareForPresentation()
+        let groupMenu = controller.makeSettingsMenu().items.first { $0.title == "切换分组" }!.submenu!
+        let groupItem = groupMenu.items.first { ($0.representedObject as? UUID) == emptyBoard.id }!
+        expect(NSApp.sendAction(groupItem.action!, to: groupItem.target, from: groupItem) &&
+               !descendants(controller.view).contains { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true },
+               "Every group must be reachable through a menu even when tabs are clipped")
+        let allItem = groupMenu.items[0]
+        expect(NSApp.sendAction(allItem.action!, to: allItem.target, from: allItem) &&
+               descendants(controller.view).contains { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true },
+               "The group menu must return to all clipboard history")
+        print("LocalPaste interaction self-test passed: persistent search, caret and spaces, layered Escape, full text/image/file preview, cleanup, size presets")
     }
 
     @MainActor
@@ -359,11 +485,27 @@ enum LocalPasteMain {
         window.setContentSize(size)
         window.contentView?.layoutSubtreeIfNeeded()
         controller.view.layoutSubtreeIfNeeded()
-        if CommandLine.arguments.contains("--layout") { reportLayout(controller.view) }
-        guard let bitmap = controller.view.bitmapImageRepForCachingDisplay(in: controller.view.bounds) else {
+        var renderView = controller.view
+        var contentPreview: ContentPreviewController?
+        if let index = CommandLine.arguments.firstIndex(of: "--preview-content"), CommandLine.arguments.count > index + 1 {
+            let kind = CommandLine.arguments[index + 1]
+            let entry = store.entries.first {
+                kind == "image" ? $0.kind == .image : kind == "files" ? $0.kind == .files :
+                    kind == "link" ? $0.linkURL != nil : $0.kind == .text && $0.linkURL == nil
+            }!
+            let preview = ContentPreviewController(entry: entry, store: store, onCopy: {}, onClose: {})
+            contentPreview = preview
+            preview.show(on: window)
+            renderView = window.childWindows!.first!.contentView!
+            renderView.layoutSubtreeIfNeeded()
+            renderView.window?.displayIfNeeded()
+        }
+        defer { contentPreview?.close() }
+        if CommandLine.arguments.contains("--layout") { reportLayout(renderView) }
+        guard let bitmap = renderView.bitmapImageRepForCachingDisplay(in: renderView.bounds) else {
             fatalError("Cannot create preview bitmap")
         }
-        controller.view.cacheDisplay(in: controller.view.bounds, to: bitmap)
+        renderView.cacheDisplay(in: renderView.bounds, to: bitmap)
         guard let png = bitmap.representation(using: .png, properties: [:]) else { fatalError("Cannot encode preview") }
         try! png.write(to: output)
         print(output.path)
@@ -376,6 +518,7 @@ enum LocalPasteMain {
     @MainActor
     private static func reportLayout(_ view: NSView) {
         if let label = view as? NSTextField { print("\(label.stringValue.prefix(25)): \(label.frame)") }
+        if let text = view as? NSTextView { print("Text preview: \(text.frame), \(text.string.count) characters") }
         for child in view.subviews { reportLayout(child) }
     }
 

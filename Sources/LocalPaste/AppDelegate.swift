@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidResignActive(_ notification: Notification) {
         if NSApp.modalWindow == nil, !isClosing {
             transitionID += 1
+            controller.prepareForDismissal()
             panel.orderOut(nil)
         }
     }
@@ -55,6 +56,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.rememberPanelSize()
         } onResetSize: { [weak self] in
             self?.resetPanelSize()
+        } onApplyPreset: { [weak self] preset in
+            self?.applyPreset(preset)
         }
         panel.contentViewController = controller
     }
@@ -136,6 +139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func closePanel() {
         guard panel.isVisible, !isClosing else { return }
+        controller.prepareForDismissal()
         transitionID += 1
         let token = transitionID
         isClosing = true
@@ -161,6 +165,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         previousApplication?.activate(options: [])
+    }
+
+    private func applyPreset(_ preset: ShelfPanelPreset) {
+        guard let screen = panel.screen ?? NSScreen.main else { return }
+        configureSizeLimits(on: screen)
+        panel.setFrame(ShelfPanelSizing.presentationFrame(on: screen.visibleFrame, preferredSize: preset.size), display: true)
+        rememberPanelSize()
     }
 
     private func registerGlobalShortcut() {
