@@ -13,24 +13,24 @@ enum ShelfPanelPreset: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .compact: return "紧凑 · 640 × 352"
-        case .standard: return "标准 · 900 × 400"
-        case .wide: return "宽大 · 1200 × 352"
+        case .compact: return "紧凑 · 640 × 288"
+        case .standard: return "标准 · 900 × 336"
+        case .wide: return "宽大 · 1200 × 288"
         }
     }
 
     var size: NSSize {
         switch self {
-        case .compact: return NSSize(width: 640, height: 352)
-        case .standard: return NSSize(width: 900, height: 400)
-        case .wide: return NSSize(width: 1200, height: 352)
+        case .compact: return NSSize(width: 640, height: 288)
+        case .standard: return NSSize(width: 900, height: 336)
+        case .wide: return NSSize(width: 1200, height: 288)
         }
     }
 }
 
 enum ShelfPanelSizing {
-    static let defaultSize = NSSize(width: 1200, height: 352)
-    static let minimumSize = NSSize(width: 640, height: 352)
+    static let defaultSize = NSSize(width: 1200, height: 288)
+    static let minimumSize = NSSize(width: 640, height: 272)
     static let screenMargin: CGFloat = 16
 
     static func availableFrame(on visibleFrame: NSRect) -> NSRect {
@@ -74,6 +74,7 @@ enum ShelfPanelSizing {
 /// Only the thin perimeter receives resize gestures; the cards and controls remain interactive.
 @MainActor
 final class ShelfResizeOverlay: NSView {
+    var onResizeStart: () -> Void = {}
     var onResizeEnd: () -> Void = {}
     private var edges: ShelfResizeEdges = []
     private var initialFrame = NSRect.zero
@@ -119,6 +120,7 @@ final class ShelfResizeOverlay: NSView {
     override func mouseDown(with event: NSEvent) {
         guard let window, let screen = window.screen ?? NSScreen.main else { return }
         edges = resizeEdges(at: convert(event.locationInWindow, from: nil))
+        if !edges.isEmpty { onResizeStart() }
         initialFrame = window.frame
         initialPointer = window.convertPoint(toScreen: event.locationInWindow)
         visibleFrame = screen.visibleFrame

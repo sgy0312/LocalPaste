@@ -6,15 +6,18 @@ final class ContentPreviewController: NSObject, NSWindowDelegate {
     let entryID: UUID
     private let entry: ClipboardEntry
     private let store: ClipboardStore
+    private let copyPasteboard: NSPasteboard
     private let onCopy: () -> Void
     private let onClose: () -> Void
     private var previewWindow: ClipboardPreviewPanel?
     private weak var parentWindow: NSWindow?
 
-    init(entry: ClipboardEntry, store: ClipboardStore, onCopy: @escaping () -> Void, onClose: @escaping () -> Void) {
+    init(entry: ClipboardEntry, store: ClipboardStore, onCopy: @escaping () -> Void, onClose: @escaping () -> Void,
+         copyPasteboard: NSPasteboard = .general) {
         self.entryID = entry.id
         self.entry = entry
         self.store = store
+        self.copyPasteboard = copyPasteboard
         self.onCopy = onCopy
         self.onClose = onClose
         super.init()
@@ -64,7 +67,7 @@ final class ContentPreviewController: NSObject, NSWindowDelegate {
     }
 
     @objc private func copyEntry() {
-        if store.copy(entry) { onCopy() }
+        if store.copy(entry, to: copyPasteboard) { onCopy() }
     }
 
     @objc private func closeEntry() { onClose() }

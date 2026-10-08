@@ -10,12 +10,14 @@ enum LocalPasteMain {
         if CommandLine.arguments.contains("--ui-self-test") {
             runSizingSelfTest()
             runInteractionSelfTest()
+            runAnimationSelfTest()
             return
         }
         if CommandLine.arguments.contains("--self-test") {
             runSelfTest()
             runSizingSelfTest()
             runInteractionSelfTest()
+            runAnimationSelfTest()
             runRetentionSelfTest()
             return
         }
@@ -146,7 +148,7 @@ enum LocalPasteMain {
         let invalid = ShelfPanelSizing.presentationFrame(on: visible, preferredSize: NSSize(width: CGFloat.nan, height: -1))
         expect(invalid.width == available.width && invalid.height == ShelfPanelSizing.defaultSize.height,
                "Invalid preferences must fall back safely")
-        let compactScreen = NSRect(x: 0, y: 0, width: 600, height: 340)
+        let compactScreen = NSRect(x: 0, y: 0, width: 600, height: 260)
         expect(ShelfPanelSizing.presentationFrame(on: compactScreen, preferredSize: nil) == ShelfPanelSizing.availableFrame(on: compactScreen),
                "Small displays must remain usable")
         let minimum = ShelfPanelSizing.resizedFrame(frame, translation: NSPoint(x: -2000, y: -2000),
@@ -190,9 +192,26 @@ enum LocalPasteMain {
                    "Choosing a menu item must update retention")
         }
         store.setRetention(.oneDay)
-        for size in [NSSize(width: 640, height: 352), NSSize(width: 800, height: 440),
-                     NSSize(width: 1200, height: 352), NSSize(width: 1000, height: 620)] {
+        let backdrop = controller.view as! NSVisualEffectView
+        let mask = backdrop.maskImage!
+        let maskBitmap = NSBitmapImageRep(data: mask.tiffRepresentation!)!
+        for point in [(0, 0), (maskBitmap.pixelsWide - 1, 0), (0, maskBitmap.pixelsHigh - 1),
+                      (maskBitmap.pixelsWide - 1, maskBitmap.pixelsHigh - 1)] {
+            expect(maskBitmap.colorAt(x: point.0, y: point.1)!.alphaComponent == 0,
+                   "All material mask corners must be transparent")
+        }
+        expect(maskBitmap.colorAt(x: maskBitmap.pixelsWide / 2, y: maskBitmap.pixelsHigh / 2)!.alphaComponent == 1 &&
+               mask.capInsets.top > 0 && mask.resizingMode == .stretch,
+               "The material mask must be opaque inside and stretch without stretching the rounded corners")
+        let textFilter = NSMenuItem(title: "文字", action: NSSelectorFromString("selectType:"), keyEquivalent: "")
+        textFilter.tag = 1
+        NSApp.sendAction(textFilter.action!, to: controller, from: textFilter)
+        let filterChip = all.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "clipboard-type-filter-chip" }!
+        for size in [NSSize(width: 640, height: 272), NSSize(width: 640, height: 288), NSSize(width: 800, height: 336),
+                     NSSize(width: 1200, height: 288), NSSize(width: 1000, height: 620)] {
             for searching in [false, true] {
+                searchField.stringValue = searching ? "调整" : ""
+                controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: searchField))
                 if searching { window.makeFirstResponder(searchField) }
                 else { window.makeFirstResponder(controller.view) }
                 window.setContentSize(size)
@@ -208,12 +227,15 @@ enum LocalPasteMain {
                 }
                 expect(!searchField.isHidden && controller.view.bounds.contains(searchField.convert(searchField.bounds, to: controller.view)),
                        "Search must remain visible and accessible in compact layouts")
+                expect(!filterChip.isHidden && filterChip.frame.width >= filterChip.intrinsicContentSize.width - 1 &&
+                       controller.view.bounds.contains(filterChip.convert(filterChip.bounds, to: controller.view)),
+                       "Active filters and their clear action must fit at every size, including global search")
                 expect(overlay.hitTest(NSPoint(x: size.width / 2, y: size.height / 2)) == nil,
                        "The card area must remain interactive")
                 expect(overlay.hitTest(NSPoint(x: size.width - 20, y: 20)) === overlay,
                        "The visible corner grip must receive resize gestures")
                 let card = descendants(controller.view).first { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true }!
-                expect(abs(card.frame.height - max(220, size.height - 124)) <= 1,
+                expect(abs(card.frame.height - max(162, size.height - 110)) <= 1,
                        "Cards must use the additional height instead of leaving a blank panel")
                 for button in descendants(card).compactMap({ $0 as? NSButton }) {
                     expect(card.bounds.contains(button.convert(button.bounds, to: card)), "Card actions must stay inside the card")
@@ -221,7 +243,7 @@ enum LocalPasteMain {
             }
         }
         if let screen = NSScreen.main {
-            let initial = ShelfPanelSizing.presentationFrame(on: screen.visibleFrame, preferredSize: NSSize(width: 800, height: 400))
+            let initial = ShelfPanelSizing.presentationFrame(on: screen.visibleFrame, preferredSize: NSSize(width: 800, height: 336))
             window.setFrame(initial, display: false)
             controller.view.layoutSubtreeIfNeeded()
             let location = NSPoint(x: initial.width / 2, y: initial.height - 3)
@@ -239,7 +261,48 @@ enum LocalPasteMain {
             expect(matches && resizeCompletions == 1,
                    "A drag must resize the actual window and finish once: initial \(initial), actual \(window.frame), expected \(expected), callbacks \(resizeCompletions), overlay \(overlay.bounds)")
         }
-        print("LocalPaste UI self-test passed: screen limits, minimum size, responsive toolbar, search, hit testing, resize gestures")
+        print("LocalPaste UI self-test passed: screen limits, compact height, responsive toolbar, search, hit testing, resize gestures, transparent material mask")
+    }
+
+    @MainActor
+    private static func runAnimationSelfTest() {
+        var clock: TimeInterval = 0
+        let animator = ShelfPanelAnimator(now: { clock })
+        let frame = NSRect(x: 100, y: 100, width: 800, height: 288)
+        let window = NSWindow(contentRect: frame.offsetBy(dx: 0, dy: -8), styleMask: [.borderless], backing: .buffered, defer: false)
+        window.alphaValue = 0
+        var obsoleteCompletion = 0
+        var completed = 0
+        animator.animate(window, to: frame, alpha: 1, direction: .opening, reducedMotion: false) { obsoleteCompletion += 1 }
+        clock = 0.08
+        animator.tick()
+        expect(window.alphaValue > 0 && window.alphaValue < 1, "Opening must progress without jumping to full opacity")
+        for index in 0..<6 {
+            let currentFrame = window.frame
+            let currentAlpha = window.alphaValue
+            let closing = index.isMultiple(of: 2)
+            animator.animate(window, to: closing ? frame.offsetBy(dx: 0, dy: -6) : frame,
+                             alpha: closing ? 0 : 1, direction: closing ? .closing : .opening, reducedMotion: false) { obsoleteCompletion += 1 }
+            expect(window.frame == currentFrame && window.alphaValue == currentAlpha,
+                   "Reversing a transition must preserve its current frame and opacity")
+            clock += 0.03
+            animator.tick()
+            expect(window.frame.size == frame.size, "Animation must never change the user's dimensions")
+        }
+        animator.animate(window, to: frame, alpha: 1, direction: .opening, reducedMotion: false) { completed += 1 }
+        clock += 1
+        animator.tick()
+        expect(window.frame == frame && window.alphaValue == 1 && !animator.isRunning && completed == 1 && obsoleteCompletion == 0,
+               "Only the latest transition must complete; rapid toggling must settle at full opacity")
+        animator.animate(window, to: frame.offsetBy(dx: 0, dy: -6), alpha: 0, direction: .closing, reducedMotion: true) { completed += 1 }
+        expect(!animator.isRunning && window.alphaValue == 0 && completed == 2, "Reduced motion must apply the final state immediately")
+        animator.animate(window, to: frame, alpha: 1, direction: .opening, reducedMotion: false) { obsoleteCompletion += 1 }
+        animator.cancel()
+        let cancelled = window.frame
+        clock += 1
+        animator.tick()
+        expect(window.frame == cancelled && obsoleteCompletion == 0, "Resize or deactivate cancellation must prevent stale callbacks")
+        print("LocalPaste animation self-test passed: continuous reversal, rapid toggles, stable dimensions, single completion, reduced motion, cancellation")
     }
 
     @MainActor
@@ -252,9 +315,11 @@ enum LocalPasteMain {
         let fullText = String(repeating: "完整预览保留所有文字和换行。\n", count: 100)
         store.recordText(fullText)
         var closes = 0
+        var copyCount = 0
         var appliedPresets: [ShelfPanelPreset] = []
-        let controller = ClipboardShelfController(store: store, previewMode: true, onCopy: {},
-                                                  onClose: { closes += 1 }, onApplyPreset: { appliedPresets.append($0) })
+        let controller = ClipboardShelfController(store: store, previewMode: true, onCopy: { copyCount += 1 },
+                                                  onClose: { closes += 1 }, onApplyPreset: { appliedPresets.append($0) },
+                                                  copyPasteboard: board)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 400),
                               styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -358,7 +423,89 @@ enum LocalPasteMain {
         expect(NSApp.sendAction(allItem.action!, to: allItem.target, from: allItem) &&
                descendants(controller.view).contains { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true },
                "The group menu must return to all clipboard history")
-        print("LocalPaste interaction self-test passed: persistent search, caret and spaces, layered Escape, full text/image/file preview, cleanup, size presets")
+        store.recordText("全局搜索目标", source: "备忘录")
+        let target = store.entries[0]
+        let otherBoard = store.createBoard(named: "另一组")!
+        store.pin(target, to: otherBoard)
+        controller.prepareForPresentation()
+        NSApp.sendAction(groupItem.action!, to: groupItem.target, from: groupItem)
+        search.stringValue = "全局搜索目标"
+        controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
+        let targetCardID = "clipboard-card-\(target.id)"
+        expect(descendants(controller.view).contains { $0.identifier?.rawValue == targetCardID },
+               "Search from an empty group must find pinned content in another group")
+        expect(descendants(controller.view).compactMap { $0 as? NSTextField }.contains { $0.stringValue == "搜索全部历史与固定内容" },
+               "Search must visibly explain its global scope")
+        expect(descendants(controller.view).compactMap { $0 as? NSTextField }.contains { $0.stringValue.hasPrefix("备忘录 · ") },
+               "Cards must show their source application without requiring hover")
+        window.makeFirstResponder(search)
+        let searchEditor2 = search.currentEditor() as! NSTextView
+        let copiesBefore = copyCount
+        expect(controller.control(search, textView: searchEditor2, doCommandBy: #selector(NSResponder.insertNewline(_:))) &&
+               window.firstResponder === controller.view && copyCount == copiesBefore,
+               "First Return in search must focus results without copying")
+        controller.view.keyDown(with: key(36, text: "\r"))
+        expect(copyCount == copiesBefore + 1 && board.string(forType: .string) == target.text,
+               "Return in results must copy the matching item to the isolated test clipboard")
+        controller.view.keyDown(with: key(48, text: "\t"))
+        expect(search.currentEditor() != nil && window.firstResponder === search.currentEditor(),
+               "Tab in results must focus the native search editor")
+        let tabEditor = search.currentEditor() as! NSTextView
+        expect(!controller.view.performKeyEquivalent(with: key(124, modifiers: .command)) && search.stringValue == "全局搜索目标",
+               "Command-arrow must not switch groups while editing search")
+        expect(controller.control(search, textView: tabEditor, doCommandBy: #selector(NSResponder.insertTab(_:))) &&
+               window.firstResponder === controller.view, "Tab in search must focus results")
+        controller.view.keyDown(with: key(48, text: "\t", modifiers: .shift))
+        expect(search.currentEditor() != nil && window.firstResponder === search.currentEditor(),
+               "Shift-Tab in results must also focus search")
+        search.stringValue = "不存在的关键词"
+        controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
+        let emptyEditor = search.currentEditor() as! NSTextView
+        let closesBefore = closes
+        expect(controller.control(search, textView: emptyEditor, doCommandBy: #selector(NSResponder.insertNewline(_:))),
+               "Search must consume Return even when no results match")
+        expect(copyCount == copiesBefore + 1 && closes == closesBefore && window.firstResponder === emptyEditor,
+               "Return with no results must leave search editable without copying or closing")
+        expect(controller.control(search, textView: emptyEditor, doCommandBy: #selector(NSResponder.cancelOperation(_:))),
+               "Search must consume Escape to clear its query")
+        expect(search.stringValue.isEmpty && !descendants(controller.view).contains { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true },
+               "Clearing global search must restore the previously selected empty group")
+        search.stringValue = "全局搜索目标"
+        controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
+        let imageTypeItem = NSMenuItem(title: "图片", action: NSSelectorFromString("selectType:"), keyEquivalent: "")
+        imageTypeItem.tag = 3
+        imageTypeItem.target = controller
+        expect(NSApp.sendAction(imageTypeItem.action!, to: imageTypeItem.target, from: imageTypeItem), "Type filter must be selectable")
+        let chip = descendants(controller.view).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "clipboard-type-filter-chip" }!
+        expect(!chip.isHidden && chip.title == "图片 ×", "Active type must have a visible clear button")
+        chip.performClick(nil)
+        expect(chip.isHidden && search.stringValue == "全局搜索目标" &&
+               descendants(controller.view).contains { $0.identifier?.rawValue == targetCardID },
+               "Clearing type must preserve the query and restore matching content")
+        window.makeFirstResponder(controller.view)
+        controller.view.keyDown(with: key(124, modifiers: .command))
+        expect(search.stringValue.isEmpty && descendants(controller.view).contains { $0.identifier?.rawValue == targetCardID },
+               "Command-right must select the next group and dismiss global search")
+        let nextMenu = controller.makeSettingsMenu().items.first { $0.title == "切换分组" }!.submenu!
+        expect(nextMenu.items.first { $0.state == .on }?.representedObject as? UUID == otherBoard.id,
+               "Group shortcuts must actually change the selected group")
+        controller.view.keyDown(with: key(123, modifiers: .command))
+        expect(!descendants(controller.view).contains { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true },
+               "Command-left must return to the previous empty group")
+        NSApp.sendAction(allItem.action!, to: allItem.target, from: allItem)
+        controller.view.keyDown(with: key(123, modifiers: .command))
+        expect(controller.makeSettingsMenu().items.first { $0.title == "切换分组" }!.submenu!.items.last!.state == .on,
+               "Command-left from history must wrap to the last group")
+        NSApp.sendAction(imageTypeItem.action!, to: controller, from: imageTypeItem)
+        window.makeFirstResponder(controller.view)
+        controller.view.keyDown(with: key(124, modifiers: .command))
+        expect(!chip.isHidden && chip.title == "图片 ×", "Group switching must preserve type filters")
+        chip.performClick(nil)
+        let nativeButton = descendants(controller.view).compactMap { $0 as? NSButton }.first { $0.title == "复制" }!
+        window.makeFirstResponder(nativeButton)
+        expect(!controller.view.performKeyEquivalent(with: key(124, modifiers: .command)),
+               "Group shortcuts must not override native button focus")
+        print("LocalPaste interaction self-test passed: first/second Return, Tab, global search and group restoration, clearable filters, group shortcuts, source labels, native editing, preview and size presets")
     }
 
     @MainActor
@@ -467,7 +614,7 @@ enum LocalPasteMain {
         store.capture(from: board, source: "预览")
         store.notice = nil
 
-        let controller = ClipboardShelfController(store: store, previewMode: true, onCopy: {})
+        let controller = ClipboardShelfController(store: store, previewMode: true, onCopy: {}, copyPasteboard: board)
         var size = ClipboardShelfController.panelSize
         if let index = CommandLine.arguments.firstIndex(of: "--size"), CommandLine.arguments.count > index + 2,
            let width = Double(CommandLine.arguments[index + 1]), let height = Double(CommandLine.arguments[index + 2]),
@@ -483,6 +630,18 @@ enum LocalPasteMain {
         }
         window.contentViewController = controller
         window.setContentSize(size)
+        if let index = CommandLine.arguments.firstIndex(of: "--type-filter"), CommandLine.arguments.count > index + 1,
+           let tag = ["text", "link", "image", "files"].firstIndex(of: CommandLine.arguments[index + 1]) {
+            let item = NSMenuItem(title: "", action: NSSelectorFromString("selectType:"), keyEquivalent: "")
+            item.tag = tag + 1
+            NSApp.sendAction(item.action!, to: controller, from: item)
+        }
+        if let index = CommandLine.arguments.firstIndex(of: "--search"), CommandLine.arguments.count > index + 1 {
+            func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+            let search = descendants(controller.view).compactMap { $0 as? NSSearchField }.first!
+            search.stringValue = CommandLine.arguments[index + 1]
+            controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
+        }
         window.contentView?.layoutSubtreeIfNeeded()
         controller.view.layoutSubtreeIfNeeded()
         var renderView = controller.view
@@ -493,7 +652,7 @@ enum LocalPasteMain {
                 kind == "image" ? $0.kind == .image : kind == "files" ? $0.kind == .files :
                     kind == "link" ? $0.linkURL != nil : $0.kind == .text && $0.linkURL == nil
             }!
-            let preview = ContentPreviewController(entry: entry, store: store, onCopy: {}, onClose: {})
+            let preview = ContentPreviewController(entry: entry, store: store, onCopy: {}, onClose: {}, copyPasteboard: board)
             contentPreview = preview
             preview.show(on: window)
             renderView = window.childWindows!.first!.contentView!

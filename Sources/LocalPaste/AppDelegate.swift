@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var previousApplication: NSRunningApplication?
     private var transitionID = 0
     private var isClosing = false
+    private let panelAnimator = ShelfPanelAnimator()
+    private var settledFrame: NSRect?
     private let widthPreference = "LocalPaste.panelWidth"
     private let heightPreference = "LocalPaste.panelHeight"
 
@@ -28,12 +30,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidResignActive(_ notification: Notification) {
         if NSApp.modalWindow == nil, !isClosing {
             transitionID += 1
+            panelAnimator.cancel()
             controller.prepareForDismissal()
             panel.orderOut(nil)
+            panel.alphaValue = 1
+            if let settledFrame { panel.setFrame(settledFrame, display: false) }
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        panelAnimator.cancel()
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let eventHandler { RemoveEventHandler(eventHandler) }
     }
@@ -58,6 +64,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.resetPanelSize()
         } onApplyPreset: { [weak self] preset in
             self?.applyPreset(preset)
+        } onResizeStart: { [weak self] in
+            self?.stopTransitionForResize()
         }
         panel.contentViewController = controller
     }
@@ -78,6 +86,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func showPanel() {
         guard !panel.isVisible || isClosing else { return }
         transitionID += 1
+        let resuming = panel.isVisible
+        panelAnimator.cancel()
         isClosing = false
         panel.ignoresMouseEvents = false
         if let front = NSWorkspace.shared.frontmostApplication,
@@ -91,24 +101,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             targetFrame = ShelfPanelSizing.presentationFrame(on: screen.visibleFrame, preferredSize: preferredPanelSize)
         }
         let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        panel.alphaValue = reduced ? 1 : 0
-        panel.setFrame(reduced ? targetFrame : targetFrame.offsetBy(dx: 0, dy: -12), display: false)
+        settledFrame = targetFrame
+        if !resuming {
+            panel.alphaValue = reduced ? 1 : 0
+            panel.setFrame(reduced ? targetFrame : targetFrame.offsetBy(dx: 0, dy: -8), display: false)
+        }
         controller.prepareForPresentation()
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         controller.focusInput()
-        if !reduced {
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.20
-                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                panel.animator().alphaValue = 1
-                panel.animator().setFrame(targetFrame, display: true)
-            }
-        }
+        panelAnimator.animate(panel, to: targetFrame, alpha: 1, direction: .opening, reducedMotion: reduced)
     }
 
     private var preferredPanelSize: NSSize? {
         let defaults = UserDefaults.standard
+        // Migrate only the former default height, preserving custom sizes and width.
+        if !defaults.bool(forKey: "LocalPaste.compactHeightMigrated") {
+            if defaults.double(forKey: heightPreference) == 352 {
+                defaults.set(ShelfPanelSizing.defaultSize.height, forKey: heightPreference)
+            }
+            defaults.set(true, forKey: "LocalPaste.compactHeightMigrated")
+        }
         guard defaults.object(forKey: widthPreference) != nil,
               defaults.object(forKey: heightPreference) != nil else { return nil }
         return NSSize(width: defaults.double(forKey: widthPreference), height: defaults.double(forKey: heightPreference))
@@ -122,19 +135,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowDidEndLiveResize(_ notification: Notification) { rememberPanelSize() }
+    func windowWillStartLiveResize(_ notification: Notification) { stopTransitionForResize() }
+
+    private func stopTransitionForResize() {
+        panelAnimator.cancel()
+        panel.alphaValue = 1
+        settledFrame = panel.frame
+    }
 
     private func rememberPanelSize() {
+        settledFrame = panel.frame
         UserDefaults.standard.set(panel.frame.width, forKey: widthPreference)
         UserDefaults.standard.set(panel.frame.height, forKey: heightPreference)
     }
 
     private func resetPanelSize() {
+        stopTransitionForResize()
         UserDefaults.standard.removeObject(forKey: widthPreference)
         UserDefaults.standard.removeObject(forKey: heightPreference)
         guard let screen = panel.screen ?? NSScreen.main else { return }
         configureSizeLimits(on: screen)
         let frame = ShelfPanelSizing.presentationFrame(on: screen.visibleFrame, preferredSize: nil)
         panel.setFrame(frame, display: true)
+        settledFrame = panel.frame
     }
 
     private func closePanel() {
@@ -144,30 +167,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let token = transitionID
         isClosing = true
         panel.ignoresMouseEvents = true
-        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            panel.orderOut(nil)
-            isClosing = false
-            panel.ignoresMouseEvents = false
-        } else {
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.12
-                context.timingFunction = CAMediaTimingFunction(name: .easeIn)
-                panel.animator().alphaValue = 0
-                panel.animator().setFrame(panel.frame.offsetBy(dx: 0, dy: -6), display: true)
-            } completionHandler: { [weak self] in
-                DispatchQueue.main.async {
-                    guard let self, self.transitionID == token else { return }
-                    self.panel.orderOut(nil)
-                    self.isClosing = false
-                    self.panel.ignoresMouseEvents = false
-                    self.panel.alphaValue = 1
-                }
-            }
+        let target = (settledFrame ?? panel.frame).offsetBy(dx: 0, dy: -6)
+        panelAnimator.animate(panel, to: target, alpha: 0, direction: .closing,
+                              reducedMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion) { [weak self] in
+            guard let self, self.transitionID == token else { return }
+            self.panel.orderOut(nil)
+            self.isClosing = false
+            self.panel.ignoresMouseEvents = false
+            self.panel.alphaValue = 1
+            if let frame = self.settledFrame { self.panel.setFrame(frame, display: false) }
         }
         previousApplication?.activate(options: [])
     }
 
     private func applyPreset(_ preset: ShelfPanelPreset) {
+        stopTransitionForResize()
         guard let screen = panel.screen ?? NSScreen.main else { return }
         configureSizeLimits(on: screen)
         panel.setFrame(ShelfPanelSizing.presentationFrame(on: screen.visibleFrame, preferredSize: preset.size), display: true)
