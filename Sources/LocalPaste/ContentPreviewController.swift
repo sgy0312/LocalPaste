@@ -33,6 +33,9 @@ final class ContentPreviewController: NSObject, NSWindowDelegate {
                                            backing: .buffered, defer: false)
         window.identifier = NSUserInterfaceItemIdentifier("clipboard-content-preview")
         window.title = "\(entry.typeName) · 预览"
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.titlebarAppearsTransparent = true
         window.isReleasedWhenClosed = false
         window.hidesOnDeactivate = false
         window.level = .floating
@@ -74,6 +77,7 @@ final class ContentPreviewController: NSObject, NSWindowDelegate {
 
     private func makeContent(size: NSSize) -> NSView {
         let container = ContentPreviewBackground(frame: NSRect(origin: .zero, size: size))
+        container.isPreview = (parentWindow?.contentView as? ShelfGlassBackground)?.isPreview ?? false
         let footer = NSView()
         footer.translatesAutoresizingMaskIntoConstraints = false
         let source = NSTextField(labelWithString: entry.sourceApplication ?? "仅存本机")
@@ -140,7 +144,17 @@ final class ContentPreviewController: NSObject, NSWindowDelegate {
             } else { text.string = entry.text ?? entry.preview }
             scroll.documentView = text
             text.layoutManager?.ensureLayout(for: text.textContainer!)
-            content = scroll
+            let plate = ShelfReadingPlate()
+            plate.translatesAutoresizingMaskIntoConstraints = false
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            plate.addSubview(scroll)
+            NSLayoutConstraint.activate([
+                scroll.leadingAnchor.constraint(equalTo: plate.leadingAnchor, constant: 6),
+                scroll.trailingAnchor.constraint(equalTo: plate.trailingAnchor, constant: -6),
+                scroll.topAnchor.constraint(equalTo: plate.topAnchor, constant: 6),
+                scroll.bottomAnchor.constraint(equalTo: plate.bottomAnchor, constant: -6)
+            ])
+            content = plate
         }
         content.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(content)
@@ -154,11 +168,12 @@ final class ContentPreviewController: NSObject, NSWindowDelegate {
     }
 }
 
-private final class ContentPreviewBackground: NSView {
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.windowBackgroundColor.setFill()
-        bounds.fill()
+private final class ContentPreviewBackground: ShelfGlassBackground {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
     }
+    required init?(coder: NSCoder) { nil }
 }
 
 @MainActor

@@ -170,6 +170,7 @@ enum LocalPasteMain {
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = ClipboardStore(storageDirectory: directory, shouldMonitor: false)
         for index in 1..<8 { store.createBoard(named: "较长的固定分组\(index)") }
+        for index in 0..<5 { store.recordText("尺寸验证内容 \(index)") }
         store.recordText(String(repeating: "调整尺寸后仍可浏览内容。", count: 45))
         var resizeCompletions = 0
         let controller = ClipboardShelfController(store: store, previewMode: true, onCopy: {}, onResizeEnd: { resizeCompletions += 1 })
@@ -203,12 +204,25 @@ enum LocalPasteMain {
         expect(maskBitmap.colorAt(x: maskBitmap.pixelsWide / 2, y: maskBitmap.pixelsHigh / 2)!.alphaComponent == 1 &&
                mask.capInsets.top > 0 && mask.resizingMode == .stretch,
                "The material mask must be opaque inside and stretch without stretching the rounded corners")
+        expect(backdrop.material == ShelfGlass.panelMaterial && backdrop.blendingMode == .behindWindow,
+               "The shelf must use a native material that samples behind its window")
+        let glassCard = descendants(controller.view).first { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true }!
+        let glassFrame = backdrop.frame
+        backdrop.layer?.borderColor = NSColor.clear.cgColor
+        glassCard.layer?.backgroundColor = NSColor.clear.cgColor
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.03))
+        expect((backdrop.layer?.borderColor?.alpha ?? 0) > 0 && (glassCard.layer?.backgroundColor?.alpha ?? 0) > 0,
+               "Workspace display-option notifications must refresh the existing shelf and cards")
+        expect(backdrop.frame == glassFrame, "Refreshing display options must preserve the user's panel size")
         let textFilter = NSMenuItem(title: "文字", action: NSSelectorFromString("selectType:"), keyEquivalent: "")
         textFilter.tag = 1
         NSApp.sendAction(textFilter.action!, to: controller, from: textFilter)
         let filterChip = all.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "clipboard-type-filter-chip" }!
+        var consistentCardSize: NSSize?
         for size in [NSSize(width: 640, height: 272), NSSize(width: 640, height: 288), NSSize(width: 800, height: 336),
-                     NSSize(width: 1200, height: 288), NSSize(width: 1000, height: 620)] {
+                     NSSize(width: 1200, height: 288), NSSize(width: 1000, height: 620),
+                     NSSize(width: 640, height: 240), NSSize(width: 1200, height: 240)] {
             for searching in [false, true] {
                 searchField.stringValue = searching ? "调整" : ""
                 controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: searchField))
@@ -219,7 +233,7 @@ enum LocalPasteMain {
                 for _ in 0..<3 { controller.view.layoutSubtreeIfNeeded() }
                 expect(controller.view.bounds.size == size, "Content must follow window dimensions: requested \(size), actual \(controller.view.bounds.size), window \(window.frame)")
                 for button in all.compactMap({ $0 as? NSButton }).filter({
-                    ["新建固定分组", "筛选内容类型", "设置与管理"].contains($0.toolTip ?? "") || $0.title == "剪贴板"
+                    ["新建固定分组", "筛选内容类型", "设置"].contains($0.toolTip ?? "") || $0.title == "剪贴板"
                 }) {
                     let rect = button.convert(button.bounds, to: controller.view)
                     expect(controller.view.bounds.insetBy(dx: -1, dy: -1).contains(rect), "Toolbar controls must fit at every size")
@@ -235,11 +249,42 @@ enum LocalPasteMain {
                 expect(overlay.hitTest(NSPoint(x: size.width - 20, y: 20)) === overlay,
                        "The visible corner grip must receive resize gestures")
                 let card = descendants(controller.view).first { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true }!
-                expect(abs(card.frame.height - max(162, size.height - 110)) <= 1,
-                       "Cards must use the additional height instead of leaving a blank panel")
-                for button in descendants(card).compactMap({ $0 as? NSButton }) {
-                    expect(card.bounds.contains(button.convert(button.bounds, to: card)), "Card actions must stay inside the card")
+                if let consistentCardSize {
+                    expect(card.frame.size == consistentCardSize,
+                           "Card dimensions must remain unchanged when the panel is resized or content is filtered")
+                } else { consistentCardSize = card.frame.size }
+                expect(card.frame.width > card.frame.height,
+                       "Cards must be compact and wider than tall: \(card.frame.size)")
+                expect(card.frame.width >= 170 && card.frame.width <= 200,
+                       "Card width must stay consistent: \(card.frame.width)")
+                expect(card.frame.height >= 110 && card.frame.height <= 140,
+                       "Card height must stay uniform and compact: \(card.frame.height)")
+                let historyViewport = descendants(controller.view).compactMap { $0 as? NSScrollView }
+                    .first { $0.documentView === card.superview }!
+                expect(card.frame.minY >= 8 && card.frame.maxY <= historyViewport.contentSize.height - 8,
+                       "Cards must fit vertically in the history viewport without hidden content")
+                for label in descendants(card).compactMap({ $0 as? NSTextField }) {
+                    expect(card.bounds.insetBy(dx: -1, dy: -1).contains(label.convert(label.bounds, to: card)),
+                           "Compact card labels must stay inside their card")
                 }
+                let orderedCards = descendants(controller.view)
+                    .filter { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true }
+                    .sorted { $0.frame.minX < $1.frame.minX }
+                for i in 0..<max(0, orderedCards.count - 1) {
+                    expect(orderedCards[i].frame.maxX < orderedCards[i + 1].frame.minX,
+                           "Cards must not overlap horizontally at size \(size)")
+                    expect(orderedCards[i].frame.height == orderedCards[i + 1].frame.height,
+                           "Cards must share one uniform height regardless of content at size \(size)")
+                    expect(orderedCards[i].frame.minY == orderedCards[i + 1].frame.minY,
+                           "Cards must remain in a single horizontal row")
+                }
+                expect(descendants(card).compactMap({ $0 as? NSButton }).isEmpty, "Cards must not carry persistent action buttons")
+                expect(card.menu?.items.contains { $0.action == NSSelectorFromString("previewEntry") } == true,
+                       "Card menus must still offer preview")
+                expect(card.menu?.items.contains { $0.action == NSSelectorFromString("pinToBoard:") } == true,
+                       "Card menus must still offer pinning to a group")
+                expect((card.accessibilityCustomActions() ?? []).contains { $0.name == "预览内容" },
+                       "Cards must expose preview as an accessibility action")
             }
         }
         if let screen = NSScreen.main {
@@ -380,12 +425,15 @@ enum LocalPasteMain {
             expect(NSApp.sendAction(item.action!, to: item.target, from: item), "Size presets must be usable as menu actions")
         }
         expect(appliedPresets == ShelfPanelPreset.allCases, "All three size presets must invoke the sizing callback")
-        let previewButton = descendants(controller.view).compactMap { $0 as? NSButton }.first { $0.toolTip == "预览完整内容" }!
-        previewButton.performClick(nil)
-        expect(window.childWindows?.count == 1, "The visible preview button must open a preview")
+        let previewCard = descendants(controller.view).first { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true }!
+        let previewItem = previewCard.menu!.items.first { $0.action == NSSelectorFromString("previewEntry") }!
+        expect(NSApp.sendAction(previewItem.action!, to: previewItem.target, from: previewItem) && window.childWindows?.count == 1,
+               "The context menu preview action must open a preview")
         controller.prepareForDismissal()
         expect(window.childWindows?.isEmpty != false, "Closing the shelf must also close the preview")
-        previewButton.performClick(nil)
+        let previewAction = previewCard.accessibilityCustomActions()!.first { $0.name == "预览内容" }!
+        expect(NSApp.sendAction(previewAction.selector!, to: previewAction.target, from: previewAction) && window.childWindows?.count == 1,
+               "The accessibility preview action must open a preview")
         store.remove(store.entries[0])
         controller.prepareForPresentation()
         expect(window.childWindows?.isEmpty != false, "Deleting a previewed entry must close its preview")
@@ -427,6 +475,7 @@ enum LocalPasteMain {
         let target = store.entries[0]
         let otherBoard = store.createBoard(named: "另一组")!
         store.pin(target, to: otherBoard)
+        store.notice = nil
         controller.prepareForPresentation()
         NSApp.sendAction(groupItem.action!, to: groupItem.target, from: groupItem)
         search.stringValue = "全局搜索目标"
@@ -434,7 +483,7 @@ enum LocalPasteMain {
         let targetCardID = "clipboard-card-\(target.id)"
         expect(descendants(controller.view).contains { $0.identifier?.rawValue == targetCardID },
                "Search from an empty group must find pinned content in another group")
-        expect(descendants(controller.view).compactMap { $0 as? NSTextField }.contains { $0.stringValue == "搜索全部历史与固定内容" },
+        expect(descendants(controller.view).compactMap { $0 as? NSTextField }.contains { $0.stringValue == "搜索全部内容" },
                "Search must visibly explain its global scope")
         expect(descendants(controller.view).compactMap { $0 as? NSTextField }.contains { $0.stringValue.hasPrefix("备忘录 · ") },
                "Cards must show their source application without requiring hover")
@@ -501,10 +550,42 @@ enum LocalPasteMain {
         controller.view.keyDown(with: key(124, modifiers: .command))
         expect(!chip.isHidden && chip.title == "图片 ×", "Group switching must preserve type filters")
         chip.performClick(nil)
-        let nativeButton = descendants(controller.view).compactMap { $0 as? NSButton }.first { $0.title == "复制" }!
+        let nativeButton = descendants(controller.view).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "clipboard-settings" }!
         window.makeFirstResponder(nativeButton)
         expect(!controller.view.performKeyEquivalent(with: key(124, modifiers: .command)),
                "Group shortcuts must not override native button focus")
+        let pinnedCard = descendants(controller.view).first { $0.identifier?.rawValue == targetCardID }!
+        let unpinAction = pinnedCard.accessibilityCustomActions()!.first { $0.name == "取消固定" }!
+        expect(NSApp.sendAction(unpinAction.selector!, to: unpinAction.target, from: unpinAction) &&
+               store.entries.first { $0.id == target.id }?.isPinned == false,
+               "The accessibility pin action must cancel a pin without a visible button")
+        controller.prepareForPresentation()
+        let unpinnedCard = descendants(controller.view).first { $0.identifier?.rawValue == targetCardID }!
+        let pinItem = unpinnedCard.menu!.items.first { ($0.representedObject as? ClipboardBoard)?.id == otherBoard.id }!
+        expect(NSApp.sendAction(pinItem.action!, to: pinItem.target, from: pinItem) &&
+               store.entries.first { $0.id == target.id }?.boardID == otherBoard.id,
+               "The context menu must still pin to the chosen group")
+        controller.prepareForPresentation()
+        let copiedCard = descendants(controller.view).first { $0.identifier?.rawValue == targetCardID }!
+        expect(copiedCard.accessibilityLabel()?.contains("已固定") == true,
+               "A fixed card must expose its state beyond color")
+        expect(copiedCard.accessibilityPerformPress() && board.string(forType: .string) == target.text,
+               "Pressing a card must copy through the injected pasteboard")
+        let status = descendants(controller.view).compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "clipboard-status" }!
+        search.stringValue = "全局搜索目标"
+        store.notice = "复制失败，请重试"
+        controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
+        expect(!status.isHidden && status.stringValue == "复制失败，请重试",
+               "An error must remain visible while searching")
+        store.togglePaused()
+        store.notice = nil
+        controller.prepareForPresentation()
+        expect(!status.isHidden && status.stringValue == "记录已暂停", "Pause status must remain visible")
+        store.togglePaused()
+        store.notice = nil
+        search.stringValue = ""
+        controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
+        expect(status.isHidden && status.stringValue.isEmpty, "Normal browsing must not show persistent footer hints")
         print("LocalPaste interaction self-test passed: first/second Return, Tab, global search and group restoration, clearable filters, group shortcuts, source labels, native editing, preview and size presets")
     }
 
@@ -541,6 +622,79 @@ enum LocalPasteMain {
         expect(store.entries.first?.linkURL?.host == "pasteapp.io", "Recognize a web link")
         store.recordText("let value: Int = 1")
         expect(store.entries.first?.linkURL == nil, "Code is not a link")
+
+        store.recordText("http://example.com")
+        expect(store.entries.first?.linkURL?.scheme == "http" && store.entries.first?.linkURL?.host == "example.com",
+               "Recognize plain http URL")
+        store.recordText("www.apple.com/iphone")
+        expect(store.entries.first?.linkURL?.host == "www.apple.com" && store.entries.first?.linkURL?.path == "/iphone",
+               "Recognize www URL with path")
+        store.recordText("docs.qq.com")
+        expect(store.entries.first?.linkURL?.host == "docs.qq.com" && store.entries.first?.linkDisplayName == "腾讯文档",
+               "Recognize bare domain and map known service name")
+        store.recordText("https://example.com/search?q=swift&sort=desc#results")
+        expect(store.entries.first?.linkURL?.host == "example.com" && store.entries.first?.linkURL?.fragment == "results",
+               "Recognize URL with query and fragment")
+        store.recordText("看看这个 https://github.com/swiftlang/swift 项目")
+        expect(store.entries.first?.linkURL?.host == "github.com",
+               "Recognize embedded https link inside text")
+        store.recordText("下载地址 www.example.com/file.zip")
+        expect(store.entries.first?.linkURL?.host == "www.example.com",
+               "Recognize embedded www link inside text")
+        store.recordText("https://example.com。")
+        expect(store.entries.first?.linkURL?.host == "example.com",
+               "Strip trailing CJK punctuation from URL")
+        store.recordText("user@example.com")
+        expect(store.entries.first?.linkURL == nil, "Email is not a web link")
+        store.recordText("1.2.3")
+        expect(store.entries.first?.linkURL == nil, "Version number is not a link")
+        store.recordText("password.123")
+        expect(store.entries.first?.linkURL == nil, "Numeric suffix is not a link")
+        store.recordText("普通文字")
+        expect(store.entries.first?.linkURL == nil, "Plain text is not a link")
+        store.recordText("去 example.com 看看")
+        expect(store.entries.first?.linkURL == nil, "Bare domain inside prose is not a link")
+        let linkCases: [(String, String)] = [
+            ("  \n参考：https://example.com/a(b)。\n  ", "example.com"),
+            ("EXAMPLE.COM/docs?q=swift#results", "example.com"),
+            ("HTTPS://EXAMPLE.COM/docs", "example.com"),
+            ("参考：www.apple.com/iphone，谢谢", "www.apple.com"),
+            ("https://example.com/路径?q=中文#段落", "example.com"),
+            ("http://localhost:8080/test", "localhost"),
+            ("http://127.0.0.1:8080/test", "127.0.0.1"),
+            ("http://[::1]:8080/test", "::1"),
+            ("先看 https://example.com/a，再看 https://apple.com/", "example.com")
+        ]
+        for (original, host) in linkCases {
+            store.recordText(original)
+            let entry = store.entries[0]
+            expect(entry.linkURL?.host?.lowercased() == host && entry.typeName == "链接",
+                   "Recognize link form: \(original)")
+            expect(store.copy(entry, to: board) && board.string(forType: .string) == original,
+                   "Recognition must preserve the entire original text including whitespace and punctuation")
+        }
+        for original in ["object.property", "example.invalid", "ftp://example.com/file", "file:///tmp/example.txt",
+                         "https://-example.com/", "https://example..com/", "http://999.999.999.999/test",
+                         "https://example.com:99999/"] {
+            store.recordText(original)
+            expect(store.entries[0].linkURL == nil && store.entries[0].typeName == "文字",
+                   "Reject non-web or malformed link: \(original)")
+        }
+        store.recordText("https://example.com/a(b)")
+        expect(store.entries[0].linkURL?.path == "/a(b)", "Balanced URL parentheses must not be removed")
+        store.recordText("docs.qq.com/sheet/example?q=1#part")
+        expect(store.entries[0].linkURL?.path == "/sheet/example" && store.entries[0].linkURL?.query == "q=1" &&
+               store.entries[0].linkURL?.fragment == "part", "Bare domain paths, queries and fragments must survive detection")
+        store.recordText("www.apple.com/iphone")
+        expect(store.entries[0].linkDisplayName == "Apple", "Known site names must also work with a www prefix")
+        var changedEntry = store.entries[0]
+        changedEntry.text = "普通文字"
+        expect(changedEntry.linkURL == nil, "An in-memory link cache must not reuse a result for changed text")
+        board.clearContents()
+        board.setString("https://example.com", forType: .string)
+        store.capture(from: board, source: "Safari")
+        expect(store.copy(store.entries[0], to: board) && board.string(forType: .string) == "https://example.com",
+               "Copy must preserve original link text verbatim")
 
         board.clearContents()
         board.setString("私密测试内容", forType: .string)
@@ -604,7 +758,8 @@ enum LocalPasteMain {
         store.pin(store.entries[0], to: links)
         store.recordText("常用回复\n\n收到，我会尽快处理。\n完成后给你反馈。", source: "备忘录")
         store.togglePin(store.entries[0])
-        let file = directory.appendingPathComponent("本周计划.txt")
+        let fileName = CommandLine.arguments.contains("--long-file-name") ? "本周项目资料与工作计划汇总待确认版本.txt" : "本周计划.txt"
+        let file = directory.appendingPathComponent(fileName)
         try! Data("本周计划".utf8).write(to: file)
         board.clearContents()
         board.writeObjects([file as NSURL])
@@ -612,6 +767,18 @@ enum LocalPasteMain {
         board.clearContents()
         board.setData(samplePNG(), forType: NSPasteboard.PasteboardType("public.png"))
         store.capture(from: board, source: "预览")
+        if CommandLine.arguments.contains("--link-examples") {
+            store.recordText("https://pasteapp.io/guide", source: "Safari")
+            store.recordText("www.apple.com/iphone", source: "备忘录")
+            store.recordText("docs.qq.com", source: "Safari")
+            store.recordText("看看这个 https://github.com/swiftlang/swift 项目", source: "信息")
+            store.recordText("https://example.com/search?q=swift&sort=desc#results", source: "Safari")
+        }
+        if CommandLine.arguments.contains("--short-text-examples") {
+            store.recordText("PROJECT_NOTES_EXAMPLE", source: "示例应用")
+            store.recordText("待确认", source: "备忘录")
+            store.recordText("24681357", source: "示例应用")
+        }
         store.notice = nil
 
         let controller = ClipboardShelfController(store: store, previewMode: true, onCopy: {}, copyPasteboard: board)

@@ -116,11 +116,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var preferredPanelSize: NSSize? {
         let defaults = UserDefaults.standard
         // Migrate only the former default height, preserving custom sizes and width.
-        if !defaults.bool(forKey: "LocalPaste.compactHeightMigrated") {
-            if defaults.double(forKey: heightPreference) == 352 {
+        if !defaults.bool(forKey: "LocalPaste.uniformCardHeightMigrated") {
+            let savedHeight = defaults.double(forKey: heightPreference)
+            if savedHeight == 352 || savedHeight == 288 {
                 defaults.set(ShelfPanelSizing.defaultSize.height, forKey: heightPreference)
             }
-            defaults.set(true, forKey: "LocalPaste.compactHeightMigrated")
+            defaults.set(true, forKey: "LocalPaste.uniformCardHeightMigrated")
         }
         guard defaults.object(forKey: widthPreference) != nil,
               defaults.object(forKey: heightPreference) != nil else { return nil }

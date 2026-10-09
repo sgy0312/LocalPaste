@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import CryptoKit
+import Darwin
 import Foundation
 import ImageIO
 
@@ -64,11 +65,103 @@ struct ClipboardEntry: Codable, Identifiable, Equatable {
     }
 
     var linkURL: URL? {
-        guard kind == .text, !preview.contains(where: { $0.isWhitespace }),
-              let url = URL(string: preview),
-              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-              let host = url.host, !host.isEmpty else { return nil }
+        guard kind == .text else { return nil }
+        let original = text ?? ""
+        let key = fingerprint as NSString
+        if let cached = Self.linkCache.object(forKey: key), cached.text == original { return cached.url }
+        let url = Self.detectLink(in: original)
+        Self.linkCache.setObject(CachedLink(text: original, url: url), forKey: key, cost: original.utf8.count + 64)
         return url
+    }
+
+    var linkDisplayName: String? {
+        guard let host = linkURL?.host else { return nil }
+        let lower = host.lowercased()
+        return Self.knownServiceNames[lower.hasPrefix("www.") ? String(lower.dropFirst(4)) : lower]
+    }
+
+    private final class CachedLink: NSObject {
+        let text: String
+        let url: URL?
+        init(text: String, url: URL?) { self.text = text; self.url = url }
+    }
+
+    private static let linkCache: NSCache<NSString, CachedLink> = {
+        let cache = NSCache<NSString, CachedLink>()
+        cache.countLimit = 256
+        cache.totalCostLimit = 8_000_000
+        return cache
+    }()
+
+    private static let knownServiceNames: [String: String] = [
+        "docs.qq.com": "腾讯文档",
+        "docs.google.com": "Google 文档",
+        "github.com": "GitHub",
+        "gist.github.com": "GitHub Gist",
+        "developer.apple.com": "Apple 开发者",
+        "apple.com": "Apple",
+        "microsoft.com": "Microsoft",
+        "office.com": "Microsoft 365",
+        "notion.so": "Notion",
+        "feishu.cn": "飞书",
+        "dingtalk.com": "钉钉",
+        "bilibili.com": "哔哩哔哩",
+        "zhihu.com": "知乎",
+        "weibo.com": "微博"
+    ]
+
+    private static let linkDetector: NSDataDetector? = {
+        try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+    }()
+
+    private static func detectLink(in text: String) -> URL? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let detector = linkDetector else { return nil }
+        let value = trimmed as NSString
+        let trailingPunctuation = CharacterSet(charactersIn: ".,，;；:：!?！？。)]}）】》\"'”’")
+        var result: URL?
+        // The detector handles punctuation and balanced URL parentheses without changing the source text.
+        detector.enumerateMatches(in: trimmed, range: NSRange(location: 0, length: value.length)) { match, _, stop in
+            guard let match, let detected = match.url,
+                  ["http", "https"].contains(detected.scheme?.lowercased() ?? "") else { return }
+            let matched = value.substring(with: match.range)
+            let lower = matched.lowercased()
+            let explicitScheme = lower.hasPrefix("http://") || lower.hasPrefix("https://")
+            let www = lower.hasPrefix("www.")
+            if !explicitScheme && !www {
+                let suffix = value.substring(from: NSMaxRange(match.range))
+                guard match.range.location == 0, !trimmed.contains(where: { $0.isWhitespace }),
+                      !matched.contains("@"), !matched.contains("://"),
+                      suffix.unicodeScalars.allSatisfy({ trailingPunctuation.contains($0) }) else { return }
+            }
+            let candidate = explicitScheme ? matched : "https://" + matched
+            guard let components = URLComponents(string: candidate), let url = components.url,
+                  let host = url.host, Self.isValidHost(host),
+                  components.port.map({ (1...65535).contains($0) }) ?? true else { return }
+            if !explicitScheme && !host.contains(".") { return }
+            result = url
+            stop.pointee = true
+        }
+        return result
+    }
+
+    private static func isValidHost(_ host: String) -> Bool {
+        let address = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if address.contains(":") {
+            var bytes = in6_addr()
+            return address.withCString { inet_pton(AF_INET6, $0, &bytes) } == 1
+        }
+        let domain = host.hasSuffix(".") ? String(host.dropLast()) : host
+        let labels = domain.split(separator: ".", omittingEmptySubsequences: false)
+        if labels.allSatisfy({ !$0.isEmpty && $0.allSatisfy({ $0.isNumber }) }) {
+            var bytes = in_addr()
+            return domain.withCString { inet_pton(AF_INET, $0, &bytes) } == 1
+        }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")
+        return !domain.isEmpty && domain.utf8.count <= 253 && labels.allSatisfy { label in
+            !label.isEmpty && label.utf8.count <= 63 && label.first != "-" && label.last != "-" &&
+            label.unicodeScalars.allSatisfy { allowed.contains($0) }
+        }
     }
 
     var typeName: String {

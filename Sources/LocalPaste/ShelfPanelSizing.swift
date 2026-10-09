@@ -13,24 +13,24 @@ enum ShelfPanelPreset: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .compact: return "紧凑 · 640 × 288"
-        case .standard: return "标准 · 900 × 336"
-        case .wide: return "宽大 · 1200 × 288"
+        case .compact: return "紧凑 · 640 × 240"
+        case .standard: return "标准 · 900 × 240"
+        case .wide: return "宽大 · 1200 × 240"
         }
     }
 
     var size: NSSize {
         switch self {
-        case .compact: return NSSize(width: 640, height: 288)
-        case .standard: return NSSize(width: 900, height: 336)
-        case .wide: return NSSize(width: 1200, height: 288)
+        case .compact: return NSSize(width: 640, height: 240)
+        case .standard: return NSSize(width: 900, height: 240)
+        case .wide: return NSSize(width: 1200, height: 240)
         }
     }
 }
 
 enum ShelfPanelSizing {
-    static let defaultSize = NSSize(width: 1200, height: 288)
-    static let minimumSize = NSSize(width: 640, height: 272)
+    static let defaultSize = NSSize(width: 1200, height: 240)
+    static let minimumSize = NSSize(width: 640, height: 240)
     static let screenMargin: CGFloat = 16
 
     static func availableFrame(on visibleFrame: NSRect) -> NSRect {
@@ -68,6 +68,21 @@ enum ShelfPanelSizing {
     private static func fitted(_ value: CGFloat, minimum: CGFloat, maximum: CGFloat, fallback: CGFloat) -> CGFloat {
         let valid = value.isFinite && value > 0 ? value : fallback
         return min(maximum, max(min(minimum, maximum), valid))
+    }
+}
+
+enum ShelfCardLayout {
+    static let cardWidth: CGFloat = 184
+    static let cardHeight: CGFloat = 128
+    static let gap: CGFloat = 11
+    static let cornerRadius: CGFloat = 16
+
+    static func cardSize(in stripHeight: CGFloat) -> NSSize {
+        let available = max(80, stripHeight - 20)
+        let height = min(cardHeight, available)
+        let ratio = cardWidth / cardHeight
+        let width = min(cardWidth, max(120, height * ratio))
+        return NSSize(width: width, height: height)
     }
 }
 

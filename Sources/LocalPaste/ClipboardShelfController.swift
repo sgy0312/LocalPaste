@@ -4,11 +4,9 @@ import Foundation
 import QuartzCore
 
 private enum ShelfGeometry {
-    static let cardWidth: CGFloat = 240
-    static let cardHeight: CGFloat = 162
-    static let gap: CGFloat = 16
-    static let cardRadius: CGFloat = 22
     static let panelRadius: CGFloat = 28
+    static let cardRadius: CGFloat = ShelfCardLayout.cornerRadius
+    static let gap: CGFloat = ShelfCardLayout.gap
 
     static let materialMask: NSImage = {
         let radius = panelRadius
@@ -73,9 +71,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
     private let menuButton = ShelfIconButton()
     private let typeFilterChip = NSButton()
     private let statusLabel = ShelfTextField(labelWithString: "")
-    private let privacyLabel = ShelfTextField(labelWithString: "")
     private let countLabel = ShelfTextField(labelWithString: "")
-    private let keyboardHint = ShelfTextField(labelWithString: "← → 选择   回车复制   空格预览   esc 返回")
     private let scrollView = HorizontalHistoryScrollView()
     private let strip = ClipboardStripView()
     private let welcome = NSView()
@@ -91,6 +87,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
     private var previewController: ContentPreviewController?
     private var showWelcome: Bool
     private var observation: AnyCancellable?
+    private var accessibilityObserver: NSObjectProtocol?
 
     init(store: ClipboardStore, previewMode: Bool = false, onCopy: @escaping () -> Void,
          onClose: @escaping () -> Void = {}, onResizeEnd: @escaping () -> Void = {},
@@ -114,11 +111,16 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
 
     required init?(coder: NSCoder) { nil }
 
+    deinit {
+        if let accessibilityObserver { NSWorkspace.shared.notificationCenter.removeObserver(accessibilityObserver) }
+    }
+
     override func loadView() {
         let root = ClipboardShelfBackdrop(frame: NSRect(origin: .zero, size: Self.panelSize))
         root.autoresizingMask = [.width, .height]
         root.isPreview = previewMode
-        root.material = .popover
+        root.glassCornerRadius = ShelfGeometry.panelRadius
+        root.material = ShelfGlass.panelMaterial
         root.blendingMode = .behindWindow
         root.state = .active
         root.wantsLayer = true
@@ -128,7 +130,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         root.layer?.backgroundColor = NSColor.clear.cgColor
         root.layer?.masksToBounds = true
         root.layer?.borderWidth = 1
-        root.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.14).cgColor
+        root.layer?.borderColor = ShelfGlass.panelBorder().cgColor
         root.keyHandler = { [weak self] event in self?.handleKey(event) ?? false }
         root.layoutHandler = { [weak self] in self?.layoutContents() }
 
@@ -153,6 +155,20 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         resize.onResizeStart = onResizeStart
         root.addSubview(resize)
         view = root
+        accessibilityObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.accessibilityOptionsChanged() }
+        }
+        refresh()
+    }
+
+    @objc private func accessibilityOptionsChanged() {
+        guard isViewLoaded else { return }
+        view.effectiveAppearance.performAsCurrentDrawingAppearance {
+            welcome.layer?.backgroundColor = ShelfGlass.welcomeFill().cgColor
+        }
+        cards.forEach { $0.refreshAppearance() }
         refresh()
     }
 
@@ -274,7 +290,8 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         let add = ShelfIconButton()
         configureIcon(add, symbol: "plus", help: "新建固定分组", action: #selector(createBoard))
         configureIcon(typeButton, symbol: "line.3.horizontal.decrease", help: "筛选内容类型", action: #selector(showTypeMenu))
-        configureIcon(menuButton, symbol: "ellipsis.circle", help: "设置与管理", action: #selector(showSettingsMenu))
+        configureIcon(menuButton, symbol: "gearshape", help: "设置", action: #selector(showSettingsMenu))
+        menuButton.identifier = NSUserInterfaceItemIdentifier("clipboard-settings")
         menuButton.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(menuButton)
         let center = NSStackView(views: [searchField, historyButton, tabScroll, add, typeButton])
@@ -310,10 +327,10 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         welcome.wantsLayer = true
         welcome.layer?.cornerRadius = ShelfGeometry.cardRadius
         welcome.layer?.cornerCurve = .continuous
-        welcome.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor
+        welcome.layer?.backgroundColor = ShelfGlass.welcomeFill().cgColor
         NSLayoutConstraint.activate([
             welcome.widthAnchor.constraint(equalToConstant: 184),
-            welcome.heightAnchor.constraint(equalToConstant: ShelfGeometry.cardHeight)
+            welcome.heightAnchor.constraint(equalToConstant: 162)
         ])
         buildWelcome()
         welcome.isHidden = !showWelcome
@@ -370,15 +387,12 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
 
     private func makeFooter() -> NSView {
         let container = fixedHeight(30)
-        privacyLabel.font = .systemFont(ofSize: 11)
-        privacyLabel.textColor = ShelfColors.secondaryText
+        statusLabel.identifier = NSUserInterfaceItemIdentifier("clipboard-status")
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = ShelfColors.secondaryText
         statusLabel.lineBreakMode = .byTruncatingTail
         countLabel.font = .systemFont(ofSize: 11)
         countLabel.textColor = ShelfColors.secondaryText
-        keyboardHint.font = .systemFont(ofSize: 11)
-        keyboardHint.textColor = ShelfColors.secondaryText
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         typeFilterChip.identifier = NSUserInterfaceItemIdentifier("clipboard-type-filter-chip")
         typeFilterChip.bezelStyle = .rounded
@@ -391,7 +405,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         typeFilterChip.isHidden = true
         typeFilterChip.setContentCompressionResistancePriority(.required, for: .horizontal)
         typeFilterChip.setContentHuggingPriority(.required, for: .horizontal)
-        let row = NSStackView(views: [privacyLabel, statusLabel, typeFilterChip, NSView(), countLabel, keyboardHint])
+        let row = NSStackView(views: [statusLabel, typeFilterChip, NSView(), countLabel])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 12
@@ -414,7 +428,6 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         for (index, button) in boardButtons.enumerated() {
             styleTab(button, selected: !searching && store.boards[index].id == selectedBoardID)
         }
-        privacyLabel.stringValue = "仅存本机 · 保留 \(store.retention.title)"
         let typeTitle = ["全部类型", "文字", "链接", "图片", "文件"][selectedType]
         typeButton.contentTintColor = selectedType == 0 ? ShelfColors.secondaryText : .systemBlue
         typeButton.toolTip = selectedType == 0 ? "筛选内容类型" : "筛选内容类型：\(typeTitle) · 点击底部 × 清除"
@@ -423,10 +436,11 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         typeFilterChip.title = "\(typeTitle) ×"
         typeFilterChip.toolTip = "清除\(typeTitle)筛选，保留关键词和分组"
         typeFilterChip.setAccessibilityLabel("清除类型筛选：\(typeTitle)")
-        if searching { statusLabel.stringValue = "搜索全部历史与固定内容" }
-        else if let notice = store.notice { statusLabel.stringValue = notice }
+        if let notice = store.notice { statusLabel.stringValue = notice }
         else if store.isPaused { statusLabel.stringValue = "记录已暂停" }
-        else { statusLabel.stringValue = "⌘F 搜索 · 点击卡片复制" }
+        else if searching { statusLabel.stringValue = "搜索全部内容" }
+        else { statusLabel.stringValue = "" }
+        statusLabel.isHidden = statusLabel.stringValue.isEmpty
         statusLabel.toolTip = statusLabel.stringValue
         rebuildHistory()
     }
@@ -470,8 +484,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         let availableTabs = max(1, width - 84 - fixedWidth)
         let tabsWidth = min(tabDocumentWidth, 420, availableTabs)
         if tabWidth.constant != tabsWidth { tabWidth.constant = tabsWidth }
-        welcome.isHidden = !showWelcome || width < 900
-        keyboardHint.isHidden = width < 1080
+        welcome.isHidden = !showWelcome || width < 900 || view.bounds.height <= 260
     }
 
     private func rebuildHistory() {
@@ -527,17 +540,18 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
     }
 
     private func layoutHistory(preserving scrollX: CGFloat) {
-        let height = max(ShelfGeometry.cardHeight, stripSize.height - 24)
-        let width = min(340, ShelfGeometry.cardWidth + (height - ShelfGeometry.cardHeight) * 0.22)
-        let gap = ShelfGeometry.gap
-        let y = max(12, (stripSize.height - height) / 2)
+        let cardSize = ShelfCardLayout.cardSize(in: stripSize.height)
+        let height = cardSize.height
+        let width = cardSize.width
+        let gap = ShelfCardLayout.gap
+        let y = max(8, (stripSize.height - height) / 2)
         for (index, card) in cards.enumerated() {
             let frame = NSRect(x: 12 + CGFloat(index) * (width + gap), y: y, width: width, height: height)
             if card.frame != frame { card.frame = frame }
         }
         let extent = 24 + CGFloat(cards.count) * width + CGFloat(max(0, cards.count - 1)) * gap
         let documentWidth = max(stripSize.width, extent)
-        strip.frame = NSRect(x: 0, y: 0, width: max(1, documentWidth), height: max(height + 24, stripSize.height))
+        strip.frame = NSRect(x: 0, y: 0, width: max(1, documentWidth), height: max(height + 16, stripSize.height))
         scrollView.contentView.scroll(to: NSPoint(x: max(0, min(scrollX, documentWidth - stripSize.width)), y: 0))
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
@@ -557,6 +571,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
             default: break
             }
             return query.isEmpty || entry.preview.localizedCaseInsensitiveContains(query) ||
+                (entry.linkDisplayName?.localizedCaseInsensitiveContains(query) ?? false) ||
                 (entry.sourceApplication?.localizedCaseInsensitiveContains(query) ?? false) ||
                 (entry.fileURLs?.contains { $0.localizedCaseInsensitiveContains(query) } ?? false)
         }.sorted { $0.createdAt > $1.createdAt }
@@ -757,6 +772,13 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         boardItem.submenu = boardMenu
         addItem(menu, "新建固定分组…", #selector(createBoard))
         addItem(menu, "清空历史…", #selector(confirmClear))
+        let helpItem = menu.addItem(withTitle: "使用帮助", action: nil, keyEquivalent: "")
+        let helpMenu = NSMenu(title: "使用帮助")
+        for hint in ["⌘⇧V 呼出或关闭面板", "点击卡片复制 · 空格预览", "⌘F 搜索 · 回车选中结果，再回车复制",
+                     "方向键选择 · ⌘← ⌘→ 切换分组", "右键卡片可预览、固定与删除", "Esc 依次关闭预览、搜索、面板"] {
+            helpMenu.addItem(withTitle: hint, action: nil, keyEquivalent: "").isEnabled = false
+        }
+        helpItem.submenu = helpMenu
         menu.addItem(.separator())
         addItem(menu, "退出本地剪贴板", #selector(quitApp))
         return menu
@@ -874,8 +896,8 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         button.contentTintColor = .labelColor
         button.effectiveAppearance.performAsCurrentDrawingAppearance {
             ShelfMotion.update(button.layer, values: [
-                "backgroundColor": (selected ? NSColor.systemBlue.withAlphaComponent(0.12) : .clear).cgColor,
-                "borderColor": (selected ? NSColor.systemBlue.withAlphaComponent(0.20) : .clear).cgColor,
+                "backgroundColor": ShelfGlass.tabFill(selected: selected).cgColor,
+                "borderColor": ShelfGlass.tabBorder(selected: selected).cgColor,
                 "borderWidth": 1
             ], animated: !previewMode)
         }
@@ -889,8 +911,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
     }
 }
 
-private final class ClipboardShelfBackdrop: NSVisualEffectView {
-    var isPreview = false
+private final class ClipboardShelfBackdrop: ShelfGlassBackground {
     var keyHandler: ((NSEvent) -> Bool)?
     var layoutHandler: (() -> Void)?
     override func layout() { super.layout(); layoutHandler?() }
@@ -903,16 +924,6 @@ private final class ClipboardShelfBackdrop: NSVisualEffectView {
     }
     override func keyDown(with event: NSEvent) {
         if keyHandler?(event) != true { super.keyDown(with: event) }
-    }
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        if isPreview {
-            NSGraphicsContext.saveGraphicsState()
-            NSBezierPath(roundedRect: bounds, xRadius: ShelfGeometry.panelRadius, yRadius: ShelfGeometry.panelRadius).addClip()
-            NSColor.windowBackgroundColor.setFill()
-            bounds.fill()
-            NSGraphicsContext.restoreGraphicsState()
-        }
     }
 }
 
@@ -946,7 +957,7 @@ private final class ShelfIconButton: NSButton {
     private func setHovered(_ hovered: Bool) {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             ShelfMotion.update(layer, values: [
-                "backgroundColor": (hovered ? NSColor.labelColor.withAlphaComponent(0.065) : .clear).cgColor
+                "backgroundColor": (hovered ? ShelfGlass.iconHoverFill() : .clear).cgColor
             ], animated: true)
         }
     }
@@ -1001,12 +1012,13 @@ private final class ClipboardShelfCard: NSView {
     private let animationsEnabled: Bool
     private let headerLabel = ShelfTextField(labelWithString: "")
     private var bodyLabel: NSTextField?
+    private var contentRegion: NSView?
     private var tracking: NSTrackingArea?
     private var isHovered = false
     var isSelected = false {
         didSet {
             if isSelected != oldValue { updateColors(animated: true) }
-            setAccessibilityValue(isSelected ? "已选中" : "未选中")
+            setAccessibilityValue((isSelected ? "已选中" : "未选中") + (entry.isPinned ? "，已固定" : ""))
         }
     }
 
@@ -1026,11 +1038,11 @@ private final class ClipboardShelfCard: NSView {
         layer?.shadowColor = NSColor.black.cgColor
         layer?.shadowOffset = NSSize(width: 0, height: -2)
         let sourcePrefix = entry.sourceApplication.map { "来自 \($0) · " } ?? ""
-        toolTip = "\(sourcePrefix)点击复制 · 底部按钮可预览、固定 · 右键可加入分组或删除"
+        toolTip = "\(sourcePrefix)点击复制 · 空格预览 · 右键可预览、固定到分组或删除"
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         let sourceSuffix = entry.sourceApplication.map { "，来自 \($0)" } ?? ""
-        setAccessibilityLabel("\(entry.typeName)\(sourceSuffix)，\(String(entry.preview.prefix(120)))，点击复制")
+        setAccessibilityLabel("\(entry.typeName)\(sourceSuffix)\(entry.isPinned ? "，已固定" : "")，\(String(entry.preview.prefix(120)))，点击复制，空格预览")
         buildContent()
         buildMenu()
         updateColors(animated: false)
@@ -1045,7 +1057,7 @@ private final class ClipboardShelfCard: NSView {
                                   cornerHeight: ShelfGeometry.cardRadius, transform: nil)
         CATransaction.commit()
         if let bodyLabel, entry.linkURL == nil {
-            let lines = max(2, Int((bounds.height - 106) / 16))
+            let lines = max(2, Int((contentRegion?.bounds.height ?? 0) / 16))
             if bodyLabel.maximumNumberOfLines != lines { bodyLabel.maximumNumberOfLines = lines }
         }
     }
@@ -1070,15 +1082,11 @@ private final class ClipboardShelfCard: NSView {
 
     private func updateColors(animated: Bool) {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            let base = NSColor.controlBackgroundColor
-            let background = isSelected ? (base.blended(withFraction: 0.05, of: .systemBlue) ?? base) : base
-            let border = isSelected ? NSColor.systemBlue.withAlphaComponent(0.85)
-                : isHovered ? NSColor.systemBlue.withAlphaComponent(0.30) : NSColor.separatorColor.withAlphaComponent(0.18)
             ShelfMotion.update(layer, values: [
-                "backgroundColor": background.withAlphaComponent(isHovered || isSelected ? 1 : 0.96).cgColor,
-                "borderColor": border.cgColor,
+                "backgroundColor": ShelfGlass.cardFill(selected: isSelected, hovered: isHovered).cgColor,
+                "borderColor": ShelfGlass.cardBorder(selected: isSelected, hovered: isHovered).cgColor,
                 "borderWidth": isSelected ? 2.0 : 0.75,
-                "shadowOpacity": isSelected || isHovered ? 0.15 : 0.08,
+                "shadowOpacity": isSelected || isHovered ? 0.16 : 0.09,
                 "shadowRadius": isSelected || isHovered ? 12.0 : 8.0
             ], animated: animated && animationsEnabled)
         }
@@ -1086,7 +1094,10 @@ private final class ClipboardShelfCard: NSView {
 
     func refreshTimestamp() {
         headerLabel.stringValue = "\(entry.typeName)  \(relativeDate(entry.createdAt))"
+        headerLabel.toolTip = headerLabel.stringValue
     }
+
+    func refreshAppearance() { updateColors(animated: false) }
 
     private func buildContent() {
         let header = headerLabel
@@ -1097,55 +1108,59 @@ private final class ClipboardShelfCard: NSView {
         let source = NSImageView(image: sourceIcon())
         source.imageScaling = .scaleProportionallyDown
         source.toolTip = entry.sourceApplication
-        let pin = cardButton(symbol: entry.isPinned ? "pin.fill" : "pin", title: "",
-                             help: entry.isPinned ? "取消固定" : "固定到常用内容", action: #selector(togglePin))
-        pin.contentTintColor = entry.isPinned ? .systemRed : ShelfColors.secondaryText
-        let preview = cardButton(symbol: "eye", title: "预览", help: "预览完整内容", action: #selector(previewEntry))
-        let copy = NSButton(title: "复制", target: self, action: #selector(copyEntry))
-        copy.bezelStyle = .rounded
-        copy.controlSize = .small
-        copy.font = .systemFont(ofSize: 12, weight: .medium)
-        copy.toolTip = "复制这条记录并返回刚才的应用"
-        copy.setAccessibilityLabel("复制这条记录")
+        var leadingIcon: NSView = source
+        if entry.isPinned {
+            let pin = NSImageView(image: NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "已固定") ?? NSImage())
+            pin.imageScaling = .scaleProportionallyDown
+            pin.contentTintColor = ShelfColors.secondaryText
+            pin.setAccessibilityLabel("已固定")
+            pin.toolTip = "已固定 · 右键可取消固定"
+            pin.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(pin)
+            leadingIcon = pin
+        }
         let metadata = ShelfTextField(labelWithString: detailText())
         metadata.toolTip = detailText()
         metadata.font = .systemFont(ofSize: 11)
         metadata.textColor = ShelfColors.secondaryText
         metadata.lineBreakMode = .byTruncatingTail
-        for child in [header, source, pin, preview, copy, metadata] {
+        for child in [header, source, metadata] {
             child.translatesAutoresizingMaskIntoConstraints = false
             addSubview(child)
         }
-        setAccessibilityChildren([preview, pin, copy])
-        NSLayoutConstraint.activate([
-            header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
-            header.topAnchor.constraint(equalTo: topAnchor, constant: 18),
+        var constraints: [NSLayoutConstraint] = [
+            header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            header.topAnchor.constraint(equalTo: topAnchor, constant: 12),
             header.heightAnchor.constraint(equalToConstant: 14),
-            header.trailingAnchor.constraint(equalTo: source.leadingAnchor, constant: -8),
-            source.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -17),
+            header.trailingAnchor.constraint(equalTo: leadingIcon.leadingAnchor, constant: -8),
+            source.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             source.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             source.widthAnchor.constraint(equalToConstant: 16), source.heightAnchor.constraint(equalToConstant: 16),
-            preview.leadingAnchor.constraint(equalTo: header.leadingAnchor),
-            preview.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
-            preview.widthAnchor.constraint(equalToConstant: 56), preview.heightAnchor.constraint(equalToConstant: 28),
-            pin.leadingAnchor.constraint(equalTo: preview.trailingAnchor, constant: 8),
-            pin.centerYAnchor.constraint(equalTo: preview.centerYAnchor),
-            pin.widthAnchor.constraint(equalToConstant: 28), pin.heightAnchor.constraint(equalToConstant: 28),
-            copy.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            copy.centerYAnchor.constraint(equalTo: preview.centerYAnchor),
-            copy.widthAnchor.constraint(equalToConstant: 64), copy.heightAnchor.constraint(equalToConstant: 28),
             metadata.leadingAnchor.constraint(equalTo: header.leadingAnchor),
-            metadata.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
-            metadata.bottomAnchor.constraint(equalTo: preview.topAnchor, constant: -8)
+            metadata.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            metadata.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12)
+        ]
+        if leadingIcon !== source {
+            constraints.append(contentsOf: [
+                leadingIcon.trailingAnchor.constraint(equalTo: source.leadingAnchor, constant: -6),
+                leadingIcon.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+                leadingIcon.widthAnchor.constraint(equalToConstant: 14), leadingIcon.heightAnchor.constraint(equalToConstant: 14)
+            ])
+        }
+        NSLayoutConstraint.activate(constraints)
+        setAccessibilityCustomActions([
+            NSAccessibilityCustomAction(name: "预览内容", target: self, selector: #selector(accessibilityPreviewEntry)),
+            NSAccessibilityCustomAction(name: entry.isPinned ? "取消固定" : "固定到常用内容", target: self, selector: #selector(accessibilityTogglePin))
         ])
         let content = NSView()
+        contentRegion = content
         content.translatesAutoresizingMaskIntoConstraints = false
         addSubview(content)
         NSLayoutConstraint.activate([
             content.leadingAnchor.constraint(equalTo: header.leadingAnchor),
-            content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
-            content.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 10),
-            content.bottomAnchor.constraint(equalTo: metadata.topAnchor, constant: -8)
+            content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            content.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
+            content.bottomAnchor.constraint(equalTo: metadata.topAnchor, constant: -6)
         ])
         if entry.kind == .image {
             let image = RoundedThumbnailView(image: store.thumbnail(for: entry) ?? NSImage())
@@ -1165,14 +1180,15 @@ private final class ClipboardShelfCard: NSView {
             NSLayoutConstraint.activate([
                 icon.centerXAnchor.constraint(equalTo: content.centerXAnchor),
                 icon.topAnchor.constraint(equalTo: content.topAnchor),
-                icon.widthAnchor.constraint(equalToConstant: 28), icon.heightAnchor.constraint(equalToConstant: 28),
+                icon.widthAnchor.constraint(equalToConstant: 24), icon.heightAnchor.constraint(equalToConstant: 24),
                 name.leadingAnchor.constraint(equalTo: content.leadingAnchor), name.trailingAnchor.constraint(equalTo: content.trailingAnchor),
                 name.topAnchor.constraint(equalTo: icon.bottomAnchor, constant: 4),
                 name.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor)
             ])
         } else {
-            let text = NSTextField(wrappingLabelWithString: String((entry.linkURL?.host ?? entry.preview).prefix(650)))
-            text.font = .systemFont(ofSize: entry.linkURL != nil ? 16 : 13, weight: entry.linkURL != nil ? .semibold : .regular)
+            let linkTitle = entry.linkDisplayName ?? entry.linkURL?.host ?? entry.preview
+            let text = NSTextField(wrappingLabelWithString: String(linkTitle.prefix(650)))
+            text.font = .systemFont(ofSize: entry.linkURL != nil ? 14 : 13, weight: entry.linkURL != nil ? .semibold : .regular)
             text.textColor = .labelColor
             text.maximumNumberOfLines = entry.linkURL == nil ? 3 : 1
             bodyLabel = text
@@ -1186,10 +1202,10 @@ private final class ClipboardShelfCard: NSView {
                 text.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor)
             ])
             if entry.linkURL != nil {
-                let url = ShelfTextField(wrappingLabelWithString: String(entry.preview.prefix(300)))
+                let url = ShelfTextField(wrappingLabelWithString: String((entry.linkURL?.absoluteString ?? entry.preview).prefix(300)))
                 url.font = .systemFont(ofSize: 12)
                 url.textColor = ShelfColors.secondaryText
-                url.maximumNumberOfLines = 2
+                url.maximumNumberOfLines = 1
                 url.lineBreakMode = .byTruncatingTail
                 url.translatesAutoresizingMaskIntoConstraints = false
                 content.addSubview(url)
@@ -1208,21 +1224,6 @@ private final class ClipboardShelfCard: NSView {
            let app = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName == source }),
            let icon = app.icon { return icon }
         return NSImage(systemSymbolName: entry.symbol, accessibilityDescription: nil) ?? NSImage()
-    }
-    private func cardButton(symbol: String, title: String, help: String, action: Selector) -> NSButton {
-        let button = ShelfIconButton(title: title, target: self, action: action)
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-        button.imagePosition = title.isEmpty ? .imageOnly : .imageLeading
-        button.isBordered = false
-        button.contentTintColor = ShelfColors.secondaryText
-        button.font = .systemFont(ofSize: 11, weight: .medium)
-        button.toolTip = help
-        button.setAccessibilityLabel(help)
-        button.focusRingType = .exterior
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 10
-        button.layer?.cornerCurve = .continuous
-        return button
     }
     private func detailText() -> String {
         let summary: String
@@ -1276,4 +1277,6 @@ private final class ClipboardShelfCard: NSView {
     @objc private func deleteEntry() { store.remove(entry) }
     @objc private func copyEntry() { onCopy() }
     @objc private func previewEntry() { onPreview() }
+    @objc private func accessibilityPreviewEntry() -> Bool { onPreview(); return true }
+    @objc private func accessibilityTogglePin() -> Bool { store.togglePin(entry); return true }
 }
