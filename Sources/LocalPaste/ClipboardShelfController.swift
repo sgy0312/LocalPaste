@@ -195,9 +195,27 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
 
     func prepareForDismissal() { closePreview(restoringFocus: false) }
 
-    func prepareForPresentation() {
+    func prepareForPresentation(resettingSelection: Bool = false) {
         store.removeExpiredEntries()
+        if resettingSelection {
+            closePreview(restoringFocus: false)
+            searchField.abortEditing()
+            searchField.stringValue = ""
+            selectedBoardID = nil
+            selectedType = 0
+            selectedID = nil
+        }
         refresh()
+        if resettingSelection {
+            // Finish any pending keyboard scroll before returning to the newest card.
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0
+                scrollView.contentView.animator().setBoundsOrigin(.zero)
+            }
+            resetScroll()
+            scrollSelectedTabIntoView()
+            focusInput()
+        }
         cards.forEach { $0.refreshTimestamp() }
     }
 

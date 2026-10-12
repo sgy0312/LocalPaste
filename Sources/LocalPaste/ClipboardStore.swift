@@ -447,14 +447,21 @@ final class ClipboardStore: ObservableObject {
     }
 
     private func checkClipboard() {
+        syncClipboard(from: NSPasteboard.general, source: NSWorkspace.shared.frontmostApplication?.localizedName)
+    }
+
+    func syncClipboardIfNeeded() {
+        guard shouldMonitor else { return }
+        syncClipboard(from: NSPasteboard.general, source: NSWorkspace.shared.frontmostApplication?.localizedName)
+    }
+
+    func syncClipboard(from pasteboard: NSPasteboard, source: String?) {
         let date = currentDate()
         if lastRetentionSweep == nil || date.timeIntervalSince(lastRetentionSweep!) >= 60 || date < lastRetentionSweep! {
             removeExpiredEntries()
         }
-        let pasteboard = NSPasteboard.general
         guard pasteboard.changeCount != lastChangeCount else { return }
         lastChangeCount = pasteboard.changeCount
-        let source = NSWorkspace.shared.frontmostApplication?.localizedName
         capture(from: pasteboard, source: source)
     }
 

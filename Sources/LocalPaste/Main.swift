@@ -10,6 +10,7 @@ enum LocalPasteMain {
         if CommandLine.arguments.contains("--ui-self-test") {
             runSizingSelfTest()
             runInteractionSelfTest()
+            runPresentationSelfTest()
             runAnimationSelfTest()
             return
         }
@@ -17,6 +18,7 @@ enum LocalPasteMain {
             runSelfTest()
             runSizingSelfTest()
             runInteractionSelfTest()
+            runPresentationSelfTest()
             runAnimationSelfTest()
             runRetentionSelfTest()
             return
@@ -587,6 +589,128 @@ enum LocalPasteMain {
         controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
         expect(status.isHidden && status.stringValue.isEmpty, "Normal browsing must not show persistent footer hints")
         print("LocalPaste interaction self-test passed: first/second Return, Tab, global search and group restoration, clearable filters, group shortcuts, source labels, native editing, preview and size presets")
+    }
+
+    @MainActor
+    private static func runPresentationSelfTest() {
+        let directory = temporaryDirectory("PresentationTest")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+
+        let emptyStore = ClipboardStore(storageDirectory: directory.appendingPathComponent("Empty"), shouldMonitor: false)
+        let emptyController = ClipboardShelfController(store: emptyStore, previewMode: true, onCopy: {}, copyPasteboard: board)
+        let emptyWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 400),
+                                   styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
+        emptyWindow.isReleasedWhenClosed = false
+        emptyWindow.contentViewController = emptyController
+        defer { emptyController.prepareForDismissal(); emptyWindow.close() }
+        emptyController.prepareForPresentation(resettingSelection: true)
+        expect(!descendants(emptyController.view).contains { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true },
+               "Empty history must present safely without cards")
+        emptyController.prepareForPresentation(resettingSelection: true)
+        expect(!descendants(emptyController.view).contains { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true },
+               "Repeated opening with empty history must remain stable")
+
+        let store = ClipboardStore(storageDirectory: directory.appendingPathComponent("Main"), shouldMonitor: false)
+        for index in 1...6 { store.recordText("第\(index)条", source: index.isMultiple(of: 2) ? "Safari" : "备忘录") }
+        let pinnedBoard = store.createBoard(named: "常用")!
+        store.pin(store.entries.first { $0.text == "第1条" }!, to: pinnedBoard)
+        var copyCount = 0
+        let controller = ClipboardShelfController(store: store, previewMode: true, onCopy: { copyCount += 1 }, copyPasteboard: board)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 400),
+                              styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentViewController = controller
+        defer { controller.prepareForDismissal(); window.close() }
+        func key(_ code: UInt16, text: String = "", modifiers: NSEvent.ModifierFlags = []) -> NSEvent {
+            NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0,
+                             windowNumber: window.windowNumber, context: nil, characters: text,
+                             charactersIgnoringModifiers: text, isARepeat: false, keyCode: code)!
+        }
+        controller.view.layoutSubtreeIfNeeded()
+        let search = descendants(controller.view).compactMap { $0 as? NSSearchField }.first!
+        let historyScroll = descendants(controller.view).compactMap { $0 as? NSScrollView }.first { $0.hasHorizontalScroller }!
+        func cardCount() -> Int { descendants(controller.view).compactMap { $0.identifier?.rawValue }.filter { $0.hasPrefix("clipboard-card-") }.count }
+        func chip() -> NSButton { descendants(controller.view).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "clipboard-type-filter-chip" }! }
+
+        controller.prepareForPresentation(resettingSelection: false)
+        expect(cardCount() == 6, "All six entries must be visible initially")
+
+        let groupMenu = controller.makeSettingsMenu().items.first { $0.title == "切换分组" }!.submenu!
+        let groupItem = groupMenu.items.first { ($0.representedObject as? UUID) == pinnedBoard.id }!
+        NSApp.sendAction(groupItem.action!, to: groupItem.target, from: groupItem)
+        expect(cardCount() == 1, "Pinned group must show only its card")
+        search.stringValue = "第"
+        controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
+        expect(cardCount() == 6, "Global search must match all entries")
+        let typeItem = NSMenuItem(title: "文字", action: NSSelectorFromString("selectType:"), keyEquivalent: "")
+        typeItem.tag = 1
+        typeItem.target = controller
+        NSApp.sendAction(typeItem.action!, to: typeItem.target, from: typeItem)
+        expect(!chip().isHidden, "Type filter must be active while browsing")
+        window.makeFirstResponder(controller.view)
+        for _ in 1...5 { controller.view.keyDown(with: key(124)) }
+        let maxScroll = max(0, historyScroll.documentView!.frame.width - historyScroll.contentSize.width)
+        if maxScroll > 0 {
+            historyScroll.contentView.scroll(to: NSPoint(x: maxScroll, y: 0))
+            historyScroll.reflectScrolledClipView(historyScroll.contentView)
+            expect(historyScroll.contentView.bounds.origin.x > 0, "Browsing must be able to scroll away from origin")
+        }
+        window.makeFirstResponder(search)
+        expect(search.currentEditor()?.string == "第", "Reopening must exercise an active search editor")
+
+        controller.prepareForDismissal()
+        board.clearContents()
+        board.setString("刚刚复制的新内容", forType: .string)
+        store.syncClipboard(from: board, source: "Safari")
+        expect(store.entries.first?.text == "刚刚复制的新内容", "Sync must capture the latest clipboard before opening")
+        expect(store.entries.first?.sourceApplication == "Safari", "Immediate sync must preserve the source application")
+        let entriesAfterSync = store.entries
+        store.syncClipboard(from: board, source: "Safari")
+        expect(store.entries == entriesAfterSync, "Unchanged clipboard must not be recorded or reordered again")
+
+        let clipboardBeforeOpening = board.changeCount
+        let copiesBefore = copyCount
+        controller.prepareForPresentation(resettingSelection: true)
+        expect(search.stringValue.isEmpty, "Reopening must clear the search query")
+        expect(search.currentEditor() == nil && window.firstResponder === controller.view,
+               "Reopening must discard the old search editor and focus the cards")
+        expect(chip().isHidden, "Reopening must clear the type filter")
+        expect(historyScroll.contentView.bounds.origin.x == 0, "Reopening must reset horizontal scroll to the start")
+        expect(cardCount() == store.entries.count, "Reopening must show all history")
+        expect(copyCount == copiesBefore && board.changeCount == clipboardBeforeOpening,
+               "Opening the panel must never copy content")
+        let newestCard = descendants(controller.view).first { $0.identifier?.rawValue == "clipboard-card-\(store.entries[0].id)" }!
+        expect((newestCard.accessibilityValue() as? String)?.hasPrefix("已选中") == true,
+               "The newest card must be visibly selected when reopening")
+        expect(controller.makeSettingsMenu().items.first { $0.title == "切换分组" }!.submenu!.items[0].state == .on,
+               "Reopening must return from the pinned group to all clipboard history")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        expect(historyScroll.contentView.bounds.origin.x == 0 && window.firstResponder === controller.view,
+               "Old scroll animations and queued refreshes must not undo the reset after opening")
+        controller.view.keyDown(with: key(36, text: "\r"))
+        expect(copyCount == copiesBefore + 1 && board.string(forType: .string) == "刚刚复制的新内容",
+               "Return must copy the newest entry after reopening")
+
+        store.togglePaused()
+        board.clearContents()
+        board.setString("暂停期间的内容", forType: .string)
+        let countWhilePaused = store.entries.count
+        store.syncClipboard(from: board, source: nil)
+        expect(store.entries.count == countWhilePaused, "Paused sync must not record")
+        store.togglePaused()
+        store.syncClipboard(from: board, source: nil)
+        expect(store.entries.count == countWhilePaused, "Resuming must not backfill an already skipped clipboard change")
+        board.clearContents()
+        board.setString("敏感内容", forType: .string)
+        board.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
+        let countBeforeSensitive = store.entries.count
+        store.syncClipboard(from: board, source: nil)
+        expect(store.entries.count == countBeforeSensitive, "Concealed sync must not record")
+
+        print("LocalPaste presentation self-test passed: reopen resets search/filter/scroll/selection, sync captures latest, pause and concealed markers are ignored")
     }
 
     @MainActor

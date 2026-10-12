@@ -106,7 +106,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             panel.alphaValue = reduced ? 1 : 0
             panel.setFrame(reduced ? targetFrame : targetFrame.offsetBy(dx: 0, dy: -8), display: false)
         }
-        controller.prepareForPresentation()
+        store.syncClipboardIfNeeded()
+        controller.prepareForPresentation(resettingSelection: true)
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         controller.focusInput()
