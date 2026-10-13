@@ -24,7 +24,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         setupPanel()
         setupStatusItem()
         registerGlobalShortcut()
-        DispatchQueue.main.async { self.showPanel() }
+        if !CommandLine.arguments.contains("--background") {
+            DispatchQueue.main.async { self.showPanel() }
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showPanel()
+        return true
     }
 
     func applicationDidResignActive(_ notification: Notification) {
