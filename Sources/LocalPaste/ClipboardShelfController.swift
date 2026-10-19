@@ -61,13 +61,8 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
     private let onApplyPreset: (ShelfPanelPreset) -> Void
     private let previewMode: Bool
     private let searchField = NSSearchField()
-    private let historyButton = NSButton()
-    private let tabs = NSStackView()
-    private let tabScroll = NSScrollView()
-    private var tabWidth: NSLayoutConstraint!
     private var searchWidth: NSLayoutConstraint!
-    private var tabDocumentWidth: CGFloat = 108
-    private let typeButton = ShelfIconButton()
+    private let typeSegmentedControl = NSSegmentedControl()
     private let menuButton = ShelfIconButton()
     private let typeFilterChip = NSButton()
     private let statusLabel = ShelfTextField(labelWithString: "")
@@ -78,11 +73,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
     private var cards: [ClipboardShelfCard] = []
     private var visibleEntries: [ClipboardEntry] = []
     private var selectedID: UUID?
-    private var selectedBoardID: UUID?
     private var selectedType = 0
-    private var boardButtons: [NSButton] = []
-    private var knownBoards: [ClipboardBoard] = []
-    private var renderedBoards: [ClipboardBoard] = []
     private var stripSize = NSSize.zero
     private var previewController: ContentPreviewController?
     private var showWelcome: Bool
@@ -201,7 +192,6 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
             closePreview(restoringFocus: false)
             searchField.abortEditing()
             searchField.stringValue = ""
-            selectedBoardID = nil
             selectedType = 0
             selectedID = nil
         }
@@ -213,7 +203,6 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
                 scrollView.contentView.animator().setBoundsOrigin(.zero)
             }
             resetScroll()
-            scrollSelectedTabIntoView()
             focusInput()
         }
         cards.forEach { $0.refreshTimestamp() }
@@ -250,13 +239,6 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         }
         // Search editors and native buttons retain their own keyboard behavior.
         guard view.window?.firstResponder === view else { return false }
-        if event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command {
-            switch event.keyCode {
-            case 123: cycleBoard(-1); return true
-            case 124: cycleBoard(1); return true
-            default: break
-            }
-        }
         guard !event.modifierFlags.contains(.command), !event.modifierFlags.contains(.control) else { return false }
         switch event.keyCode {
         case 36, 76: copySelected()
@@ -279,7 +261,6 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
 
     private func makeToolbar() -> NSView {
         let container = fixedHeight(56)
-        configureTab(historyButton, title: "剪贴板", symbol: "clock.arrow.circlepath", action: #selector(showHistory))
         searchField.placeholderString = "搜索内容、文件名或应用"
         searchField.setAccessibilityLabel("搜索剪贴板")
         searchField.toolTip = "搜索内容、文件名或来源应用（⌘F）"
@@ -290,29 +271,36 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         searchField.controlSize = .regular
         searchField.translatesAutoresizingMaskIntoConstraints = false
         searchWidth = searchField.widthAnchor.constraint(equalToConstant: 220)
+        // Prefer a useful width without making it the window's minimum fitting width.
+        searchWidth.priority = NSLayoutConstraint.Priority(rawValue: 49)
         searchWidth.isActive = true
+        searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 140).isActive = true
 
-        tabs.orientation = .horizontal
-        tabs.alignment = .centerY
-        tabs.spacing = 8
-        tabScroll.drawsBackground = false
-        tabScroll.borderType = .noBorder
-        tabScroll.hasHorizontalScroller = false
-        tabScroll.documentView = tabs
-        tabScroll.translatesAutoresizingMaskIntoConstraints = false
-        tabWidth = tabScroll.widthAnchor.constraint(equalToConstant: 108)
-        tabWidth.priority = .defaultLow
-        NSLayoutConstraint.activate([tabWidth, tabScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 1),
-                                     tabScroll.heightAnchor.constraint(equalToConstant: 38)])
-
-        let add = ShelfIconButton()
-        configureIcon(add, symbol: "plus", help: "新建固定分组", action: #selector(createBoard))
-        configureIcon(typeButton, symbol: "line.3.horizontal.decrease", help: "筛选内容类型", action: #selector(showTypeMenu))
+        typeSegmentedControl.segmentCount = 5
+        typeSegmentedControl.identifier = NSUserInterfaceItemIdentifier("clipboard-type-selector")
+        typeSegmentedControl.setLabel("全部类型", forSegment: 0)
+        typeSegmentedControl.setLabel("文字", forSegment: 1)
+        typeSegmentedControl.setLabel("链接", forSegment: 2)
+        typeSegmentedControl.setLabel("图片", forSegment: 3)
+        typeSegmentedControl.setLabel("文件", forSegment: 4)
+        typeSegmentedControl.target = self
+        typeSegmentedControl.action = #selector(selectTypeSegment(_:))
+        typeSegmentedControl.controlSize = .small
+        typeSegmentedControl.font = .systemFont(ofSize: 12, weight: .semibold)
+        for index in 0..<5 {
+            typeSegmentedControl.setWidth(index == 0 ? 64 : 40, forSegment: index)
+        }
+        typeSegmentedControl.trackingMode = .selectOne
+        typeSegmentedControl.setSelected(true, forSegment: 0)
+        typeSegmentedControl.toolTip = "筛选内容类型"
+        typeSegmentedControl.setAccessibilityLabel("筛选内容类型")
+        typeSegmentedControl.translatesAutoresizingMaskIntoConstraints = false
+        typeSegmentedControl.setContentCompressionResistancePriority(.required, for: .horizontal)
         configureIcon(menuButton, symbol: "gearshape", help: "设置", action: #selector(showSettingsMenu))
         menuButton.identifier = NSUserInterfaceItemIdentifier("clipboard-settings")
         menuButton.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(menuButton)
-        let center = NSStackView(views: [searchField, historyButton, tabScroll, add, typeButton])
+        let center = NSStackView(views: [searchField, typeSegmentedControl])
         center.orientation = .horizontal
         center.alignment = .centerY
         center.spacing = 8
@@ -440,19 +428,17 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
 
     private func refresh() {
         guard isViewLoaded else { return }
-        if knownBoards != store.boards { rebuildTabs() }
+        updateResponsiveChrome()
         let searching = !searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        styleTab(historyButton, selected: !searching && selectedBoardID == nil)
-        for (index, button) in boardButtons.enumerated() {
-            styleTab(button, selected: !searching && store.boards[index].id == selectedBoardID)
-        }
         let typeTitle = ["全部类型", "文字", "链接", "图片", "文件"][selectedType]
-        typeButton.contentTintColor = selectedType == 0 ? ShelfColors.secondaryText : .systemBlue
-        typeButton.toolTip = selectedType == 0 ? "筛选内容类型" : "筛选内容类型：\(typeTitle) · 点击底部 × 清除"
-        typeButton.setAccessibilityValue(typeTitle)
+        if !typeSegmentedControl.isSelected(forSegment: selectedType) {
+            typeSegmentedControl.setSelected(true, forSegment: selectedType)
+        }
+        typeSegmentedControl.toolTip = selectedType == 0 ? "筛选内容类型" : "筛选内容类型：\(typeTitle) · 点击底部 × 清除"
+        typeSegmentedControl.setAccessibilityValue(typeTitle)
         typeFilterChip.isHidden = selectedType == 0
         typeFilterChip.title = "\(typeTitle) ×"
-        typeFilterChip.toolTip = "清除\(typeTitle)筛选，保留关键词和分组"
+        typeFilterChip.toolTip = "清除\(typeTitle)筛选，保留关键词"
         typeFilterChip.setAccessibilityLabel("清除类型筛选：\(typeTitle)")
         if let notice = store.notice { statusLabel.stringValue = notice }
         else if store.isPaused { statusLabel.stringValue = "记录已暂停" }
@@ -463,45 +449,11 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         rebuildHistory()
     }
 
-    private func rebuildTabs() {
-        tabs.arrangedSubviews.forEach { tabs.removeArrangedSubview($0); $0.removeFromSuperview() }
-        boardButtons.removeAll()
-        let colors: [NSColor] = [.systemRed, .systemOrange, .systemBlue, .systemPurple, .systemGreen]
-        var x: CGFloat = 0
-        for (index, board) in store.boards.enumerated() {
-            let button = NSButton()
-            configureTab(button, title: board.name, symbol: "circle.fill", action: #selector(selectBoard(_:)))
-            button.tag = index
-            button.image?.isTemplate = false
-            let colored = NSImage(size: NSSize(width: 10, height: 10))
-            colored.lockFocus()
-            colors[index % colors.count].setFill()
-            NSBezierPath(ovalIn: NSRect(x: 1, y: 1, width: 8, height: 8)).fill()
-            colored.unlockFocus()
-            button.image = colored
-            let width = max(88, button.intrinsicContentSize.width + 14)
-            button.widthAnchor.constraint(equalToConstant: width).isActive = true
-            tabs.addArrangedSubview(button)
-            boardButtons.append(button)
-            x += width + 8
-        }
-        let width = max(1, x - 8)
-        tabs.frame = NSRect(x: 0, y: 0, width: width, height: 38)
-        tabDocumentWidth = width
-        updateResponsiveChrome()
-        knownBoards = store.boards
-    }
-
     private func updateResponsiveChrome() {
-        guard isViewLoaded, tabWidth != nil, searchWidth != nil else { return }
+        guard isViewLoaded, searchWidth != nil else { return }
         let width = view.bounds.width
-        let search = min(240, max(180, width - 460))
+        let search = min(320, max(140, width - 420))
         if searchWidth.constant != search { searchWidth.constant = search }
-        // Leave space for the fixed controls, gaps, and the menu at the right edge.
-        let fixedWidth: CGFloat = 200 + search
-        let availableTabs = max(1, width - 84 - fixedWidth)
-        let tabsWidth = min(tabDocumentWidth, 420, availableTabs)
-        if tabWidth.constant != tabsWidth { tabWidth.constant = tabsWidth }
         welcome.isHidden = !showWelcome || width < 900 || view.bounds.height <= 260
     }
 
@@ -513,7 +465,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
             closePreview()
         }
         stripSize = scrollView.contentSize
-        if nextEntries == visibleEntries, renderedBoards == store.boards, !cards.isEmpty {
+        if nextEntries == visibleEntries, !cards.isEmpty {
             if !visibleEntries.contains(where: { $0.id == selectedID }) { selectedID = visibleEntries.first?.id }
             layoutHistory(preserving: scrollX)
             updateSelection()
@@ -522,12 +474,10 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         strip.subviews.forEach { $0.removeFromSuperview() }
         cards.removeAll()
         visibleEntries = nextEntries
-        renderedBoards = store.boards
         if !visibleEntries.contains(where: { $0.id == selectedID }) { selectedID = visibleEntries.first?.id }
         if visibleEntries.isEmpty {
             let message: String
             if !searchField.stringValue.isEmpty { message = "没有找到匹配内容\n试试其他关键词，或按 Esc 清除搜索" }
-            else if selectedBoardID != nil { message = "这个分组还没有内容\n右键点击卡片，将常用内容固定到这里" }
             else if selectedType != 0 { message = "还没有这类内容\n复制后会自动出现在这里，或选择全部类型" }
             else if store.isPaused { message = "记录已暂停\n在设置中恢复后，继续保存新复制的内容" }
             else { message = "还没有剪贴板内容\n复制文字、链接、图片或文件后，随时回来找" }
@@ -576,11 +526,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
 
     private func filteredEntries() -> [ClipboardEntry] {
         let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let entries: [ClipboardEntry]
-        if !query.isEmpty { entries = store.entries }
-        else if let board = store.boards.first(where: { $0.id == selectedBoardID }) { entries = store.entries(in: board) }
-        else { entries = store.entries }
-        return entries.filter { entry in
+        return store.entries.filter { entry in
             switch selectedType {
             case 1: if entry.kind != .text || entry.linkURL != nil { return false }
             case 2: if entry.linkURL == nil { return false }
@@ -647,54 +593,6 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         focusInput()
     }
 
-    private func cycleBoard(_ step: Int) {
-        let boards = store.boards
-        let count = 1 + boards.count
-        let current = selectedBoardID.flatMap { id in boards.firstIndex(where: { $0.id == id }) }.map { $0 + 1 } ?? 0
-        let next = (current + step + count) % count
-        selectedBoardID = next == 0 ? nil : boards[next - 1].id
-        searchField.stringValue = ""
-        selectedID = nil
-        refresh()
-        resetScroll()
-        scrollSelectedTabIntoView()
-    }
-
-    private func scrollSelectedTabIntoView() {
-        if selectedBoardID == nil {
-            tabScroll.contentView.scroll(to: .zero)
-        } else if let index = store.boards.firstIndex(where: { $0.id == selectedBoardID }), index < boardButtons.count {
-            view.layoutSubtreeIfNeeded()
-            let target = boardButtons[index]
-            let clip = tabScroll.contentView
-            let frame = target.convert(target.bounds, to: tabs)
-            var x = clip.bounds.minX
-            if frame.minX < clip.bounds.minX { x = frame.minX }
-            else if frame.maxX > clip.bounds.maxX { x = frame.maxX - clip.bounds.width }
-            x = max(0, min(x, tabs.bounds.width - clip.bounds.width))
-            clip.scroll(to: NSPoint(x: x, y: 0))
-        }
-        tabScroll.reflectScrolledClipView(tabScroll.contentView)
-    }
-
-    @objc private func showHistory() {
-        selectedBoardID = nil
-        searchField.stringValue = ""
-        selectedID = nil
-        refresh()
-        resetScroll()
-        scrollSelectedTabIntoView()
-        focusInput()
-    }
-    @objc private func selectBoard(_ sender: NSButton) {
-        selectedBoardID = store.boards[sender.tag].id
-        searchField.stringValue = ""
-        selectedID = nil
-        refresh()
-        resetScroll()
-        scrollSelectedTabIntoView()
-        focusInput()
-    }
     private func resetScroll() {
         scrollView.contentView.scroll(to: .zero)
         scrollView.reflectScrolledClipView(scrollView.contentView)
@@ -708,36 +606,15 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         rebuildHistory()
     }
 
-    @objc private func createBoard() {
-        let alert = NSAlert()
-        alert.messageText = "新建固定分组"
-        alert.informativeText = "例如“实用链接”或“常用回复”。名称最多 12 个字。"
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 250, height: 26))
-        input.placeholderString = "分组名称"
-        alert.accessoryView = input
-        alert.addButton(withTitle: "创建")
-        alert.addButton(withTitle: "取消")
-        alert.window.initialFirstResponder = input
-        if alert.runModal() == .alertFirstButtonReturn, let board = store.createBoard(named: input.stringValue) {
-            selectedBoardID = board.id
-            selectedID = nil
-        }
-        refresh()
-        focusInput()
-    }
-
-    @objc private func showTypeMenu() {
-        let menu = NSMenu()
-        for (index, title) in ["全部类型", "文字", "链接", "图片", "文件"].enumerated() {
-            let item = menu.addItem(withTitle: title, action: #selector(selectType(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = index
-            item.state = selectedType == index ? .on : .off
-        }
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: typeButton.bounds.minY), in: typeButton)
-    }
     @objc private func selectType(_ sender: NSMenuItem) {
-        selectedType = sender.tag
+        applyTypeFilter(sender.tag)
+    }
+    @objc private func selectTypeSegment(_ sender: NSSegmentedControl) {
+        applyTypeFilter(sender.selectedSegment)
+    }
+    private func applyTypeFilter(_ type: Int) {
+        guard (0..<5).contains(type) else { return }
+        selectedType = type
         selectedID = nil
         refresh()
         resetScroll()
@@ -776,24 +653,11 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         sizeMenu.addItem(.separator())
         addItem(sizeMenu, "恢复默认大小", #selector(resetPanelSize))
         sizeItem.submenu = sizeMenu
-        let boardItem = menu.addItem(withTitle: "切换分组", action: nil, keyEquivalent: "")
-        let boardMenu = NSMenu(title: "切换分组")
-        let history = boardMenu.addItem(withTitle: "全部剪贴板", action: #selector(showHistory), keyEquivalent: "")
-        history.target = self
-        history.state = selectedBoardID == nil ? .on : .off
-        for board in store.boards {
-            let item = boardMenu.addItem(withTitle: board.name, action: #selector(selectBoardFromMenu(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = board.id
-            item.state = selectedBoardID == board.id ? .on : .off
-        }
-        boardItem.submenu = boardMenu
-        addItem(menu, "新建固定分组…", #selector(createBoard))
         addItem(menu, "清空历史…", #selector(confirmClear))
         let helpItem = menu.addItem(withTitle: "使用帮助", action: nil, keyEquivalent: "")
         let helpMenu = NSMenu(title: "使用帮助")
         for hint in ["⌘⇧V 呼出或关闭面板", "点击卡片复制 · 空格预览", "⌘F 搜索 · 回车选中结果，再回车复制",
-                     "方向键选择 · ⌘← ⌘→ 切换分组", "右键卡片可预览、固定与删除", "Esc 依次关闭预览、搜索、面板"] {
+                     "方向键选择记录", "右键卡片可预览、固定与删除", "Esc 依次关闭预览、搜索、面板"] {
             helpMenu.addItem(withTitle: hint, action: nil, keyEquivalent: "").isEnabled = false
         }
         helpItem.submenu = helpMenu
@@ -807,16 +671,6 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         refresh()
     }
     @objc private func resetPanelSize() { onResetSize() }
-    @objc private func selectBoardFromMenu(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? UUID else { return }
-        selectedBoardID = id
-        searchField.stringValue = ""
-        selectedID = nil
-        refresh()
-        resetScroll()
-        scrollSelectedTabIntoView()
-        focusInput()
-    }
     @objc private func selectPreset(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let preset = ShelfPanelPreset(rawValue: raw) else { return }
         onApplyPreset(preset)
@@ -861,7 +715,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "清空全部历史？"
-        alert.informativeText = "这会删除本机保存的所有记录和图片，包括分组中的固定内容。"
+        alert.informativeText = "这会删除本机保存的所有记录和图片，包括已固定的记录。"
         alert.addButton(withTitle: "取消")
         alert.addButton(withTitle: "清空")
         if alert.runModal() == .alertSecondButtonReturn { store.clearHistory() }
@@ -893,32 +747,6 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         button.layer?.cornerRadius = 14
         button.layer?.cornerCurve = .continuous
         NSLayoutConstraint.activate([button.widthAnchor.constraint(equalToConstant: 32), button.heightAnchor.constraint(equalToConstant: 32)])
-    }
-    private func configureTab(_ button: NSButton, title: String, symbol: String, action: Selector) {
-        button.title = title
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-        button.imagePosition = .imageLeading
-        button.font = .systemFont(ofSize: 12, weight: .semibold)
-        button.isBordered = false
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 16
-        button.layer?.cornerCurve = .continuous
-        button.target = self
-        button.action = action
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.heightAnchor.constraint(equalToConstant: 34).isActive = true
-        if button === historyButton { button.widthAnchor.constraint(equalToConstant: 96).isActive = true }
-    }
-    private func styleTab(_ button: NSButton, selected: Bool) {
-        button.setAccessibilityValue(selected ? "已选中" : "未选中")
-        button.contentTintColor = .labelColor
-        button.effectiveAppearance.performAsCurrentDrawingAppearance {
-            ShelfMotion.update(button.layer, values: [
-                "backgroundColor": ShelfGlass.tabFill(selected: selected).cgColor,
-                "borderColor": ShelfGlass.tabBorder(selected: selected).cgColor,
-                "borderWidth": 1
-            ], animated: !previewMode)
-        }
     }
     private func label(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, color: NSColor = .labelColor) -> NSTextField {
         let field = ShelfTextField(labelWithString: text)
@@ -1056,7 +884,7 @@ private final class ClipboardShelfCard: NSView {
         layer?.shadowColor = NSColor.black.cgColor
         layer?.shadowOffset = NSSize(width: 0, height: -2)
         let sourcePrefix = entry.sourceApplication.map { "来自 \($0) · " } ?? ""
-        toolTip = "\(sourcePrefix)点击复制 · 空格预览 · 右键可预览、固定到分组或删除"
+        toolTip = "\(sourcePrefix)点击复制 · 空格预览 · 右键可预览、固定或删除"
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         let sourceSuffix = entry.sourceApplication.map { "，来自 \($0)" } ?? ""
@@ -1168,7 +996,7 @@ private final class ClipboardShelfCard: NSView {
         NSLayoutConstraint.activate(constraints)
         setAccessibilityCustomActions([
             NSAccessibilityCustomAction(name: "预览内容", target: self, selector: #selector(accessibilityPreviewEntry)),
-            NSAccessibilityCustomAction(name: entry.isPinned ? "取消固定" : "固定到常用内容", target: self, selector: #selector(accessibilityTogglePin))
+            NSAccessibilityCustomAction(name: entry.isPinned ? "取消固定" : "固定记录", target: self, selector: #selector(accessibilityTogglePin))
         ])
         let content = NSView()
         contentRegion = content
@@ -1273,23 +1101,12 @@ private final class ClipboardShelfCard: NSView {
         let preview = menu.addItem(withTitle: "预览内容", action: #selector(previewEntry), keyEquivalent: "")
         preview.target = self
         menu.addItem(.separator())
-        for board in store.boards {
-            let item = menu.addItem(withTitle: "固定到“\(board.name)”", action: #selector(pinToBoard(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = board
-            item.state = entry.isPinned && (entry.boardID ?? store.boards.first?.id) == board.id ? .on : .off
-        }
-        if entry.isPinned {
-            let item = menu.addItem(withTitle: "取消固定", action: #selector(togglePin), keyEquivalent: "")
-            item.target = self
-        }
+        let pin = menu.addItem(withTitle: entry.isPinned ? "取消固定" : "固定记录", action: #selector(togglePin), keyEquivalent: "")
+        pin.target = self
         menu.addItem(.separator())
         let delete = menu.addItem(withTitle: "删除记录", action: #selector(deleteEntry), keyEquivalent: "")
         delete.target = self
         self.menu = menu
-    }
-    @objc private func pinToBoard(_ sender: NSMenuItem) {
-        if let board = sender.representedObject as? ClipboardBoard { store.pin(entry, to: board) }
     }
     @objc private func togglePin() { store.togglePin(entry) }
     @objc private func deleteEntry() { store.remove(entry) }

@@ -278,10 +278,10 @@ final class ClipboardStore: ObservableObject {
     func togglePin(_ entry: ClipboardEntry) {
         guard let index = entries.firstIndex(where: { $0.id == entry.id }) else { return }
         entries[index].isPinned.toggle()
-        entries[index].boardID = entries[index].isPinned ? boards.first?.id : nil
+        entries[index].boardID = nil
         let isPinned = entries[index].isPinned
         saveHistory()
-        notice = isPinned ? "已固定到常用内容" : "已取消固定"
+        notice = isPinned ? "已固定" : "已取消固定"
         if !isPinned {
             removeExpiredEntries()
             if !entries.contains(where: { $0.id == entry.id }) { notice = "已取消固定，记录已到期" }

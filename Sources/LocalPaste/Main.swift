@@ -181,6 +181,11 @@ enum LocalPasteMain {
         window.contentViewController = controller
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
         let all = descendants(controller.view)
+        expect(!all.compactMap({ $0 as? NSButton }).contains {
+            ["常用内容", "剪贴板"].contains($0.title) || $0.toolTip == "新建固定分组" || $0.action == NSSelectorFromString("selectBoard:")
+        }, "The toolbar must not recreate favorites, history tabs or the add-group button")
+        expect(!controller.makeSettingsMenu().items.contains { $0.title.contains("分组") },
+               "Settings must not offer removed group features")
         let overlay = all.compactMap { $0 as? ShelfResizeOverlay }.first!
         let searchField = all.compactMap { $0 as? NSSearchField }.first!
         for retention in ClipboardRetention.allCases {
@@ -216,7 +221,7 @@ enum LocalPasteMain {
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
         expect((backdrop.layer?.borderColor?.alpha ?? 0) > 0 && (glassCard.layer?.backgroundColor?.alpha ?? 0) > 0,
                "Workspace display-option notifications must refresh the existing shelf and cards")
-        expect(backdrop.frame == glassFrame, "Refreshing display options must preserve the user's panel size")
+        expect(backdrop.frame == glassFrame, "Refreshing display options must preserve the user's panel size: before \(glassFrame), after \(backdrop.frame)")
         let textFilter = NSMenuItem(title: "文字", action: NSSelectorFromString("selectType:"), keyEquivalent: "")
         textFilter.tag = 1
         NSApp.sendAction(textFilter.action!, to: controller, from: textFilter)
@@ -233,11 +238,16 @@ enum LocalPasteMain {
                 window.setContentSize(size)
                 window.contentView?.layoutSubtreeIfNeeded()
                 for _ in 0..<3 { controller.view.layoutSubtreeIfNeeded() }
-                expect(controller.view.bounds.size == size, "Content must follow window dimensions: requested \(size), actual \(controller.view.bounds.size), window \(window.frame)")
-                for button in all.compactMap({ $0 as? NSButton }).filter({
-                    ["新建固定分组", "筛选内容类型", "设置"].contains($0.toolTip ?? "") || $0.title == "剪贴板"
-                }) {
-                    let rect = button.convert(button.bounds, to: controller.view)
+                expect(controller.view.bounds.size == size, "Content must follow window dimensions: requested \(size), actual \(controller.view.bounds.size), window \(window.frame), search \(searchField.frame), segments \(all.compactMap { $0 as? NSSegmentedControl }.map { $0.frame })")
+                for control in all.filter({ $0 is NSSegmentedControl || $0 is NSButton }) {
+                    let relevant: Bool
+                    if let button = control as? NSButton {
+                        relevant = button.toolTip == "设置"
+                    } else {
+                        relevant = true
+                    }
+                    guard relevant else { continue }
+                    let rect = control.convert(control.bounds, to: controller.view)
                     expect(controller.view.bounds.insetBy(dx: -1, dy: -1).contains(rect), "Toolbar controls must fit at every size")
                     expect(overlay.hitTest(NSPoint(x: rect.midX, y: rect.midY)) == nil, "Resize handles must not steal toolbar clicks")
                 }
@@ -283,8 +293,8 @@ enum LocalPasteMain {
                 expect(descendants(card).compactMap({ $0 as? NSButton }).isEmpty, "Cards must not carry persistent action buttons")
                 expect(card.menu?.items.contains { $0.action == NSSelectorFromString("previewEntry") } == true,
                        "Card menus must still offer preview")
-                expect(card.menu?.items.contains { $0.action == NSSelectorFromString("pinToBoard:") } == true,
-                       "Card menus must still offer pinning to a group")
+                expect(card.menu?.items.contains { $0.action == NSSelectorFromString("togglePin") } == true,
+                       "Card menus must offer simple pinning without groups")
                 expect((card.accessibilityCustomActions() ?? []).contains { $0.name == "预览内容" },
                        "Cards must expose preview as an accessibility action")
             }
@@ -462,29 +472,19 @@ enum LocalPasteMain {
         let image = descendants(imageWindow.contentView!).compactMap { $0 as? NSImageView }.first!
         expect(image.image != nil && image.bounds.width > 0 && image.bounds.height > 0, "Image previews must have visible content")
         imagePreview.close()
-        let emptyBoard = store.createBoard(named: "空分组")!
-        controller.prepareForPresentation()
-        let groupMenu = controller.makeSettingsMenu().items.first { $0.title == "切换分组" }!.submenu!
-        let groupItem = groupMenu.items.first { ($0.representedObject as? UUID) == emptyBoard.id }!
-        expect(NSApp.sendAction(groupItem.action!, to: groupItem.target, from: groupItem) &&
-               !descendants(controller.view).contains { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true },
-               "Every group must be reachable through a menu even when tabs are clipped")
-        let allItem = groupMenu.items[0]
-        expect(NSApp.sendAction(allItem.action!, to: allItem.target, from: allItem) &&
-               descendants(controller.view).contains { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true },
-               "The group menu must return to all clipboard history")
         store.recordText("全局搜索目标", source: "备忘录")
         let target = store.entries[0]
         let otherBoard = store.createBoard(named: "另一组")!
         store.pin(target, to: otherBoard)
         store.notice = nil
         controller.prepareForPresentation()
-        NSApp.sendAction(groupItem.action!, to: groupItem.target, from: groupItem)
+        expect(descendants(controller.view).contains { $0.identifier?.rawValue == "clipboard-card-\(target.id)" },
+               "Existing grouped records must remain visible in ordinary history")
         search.stringValue = "全局搜索目标"
         controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
         let targetCardID = "clipboard-card-\(target.id)"
         expect(descendants(controller.view).contains { $0.identifier?.rawValue == targetCardID },
-               "Search from an empty group must find pinned content in another group")
+               "Search must find records from legacy groups in ordinary history")
         expect(descendants(controller.view).compactMap { $0 as? NSTextField }.contains { $0.stringValue == "搜索全部内容" },
                "Search must visibly explain its global scope")
         expect(descendants(controller.view).compactMap { $0 as? NSTextField }.contains { $0.stringValue.hasPrefix("备忘录 · ") },
@@ -503,7 +503,7 @@ enum LocalPasteMain {
                "Tab in results must focus the native search editor")
         let tabEditor = search.currentEditor() as! NSTextView
         expect(!controller.view.performKeyEquivalent(with: key(124, modifiers: .command)) && search.stringValue == "全局搜索目标",
-               "Command-arrow must not switch groups while editing search")
+               "Command-arrow must retain native search editing behavior")
         expect(controller.control(search, textView: tabEditor, doCommandBy: #selector(NSResponder.insertTab(_:))) &&
                window.firstResponder === controller.view, "Tab in search must focus results")
         controller.view.keyDown(with: key(48, text: "\t", modifiers: .shift))
@@ -519,8 +519,8 @@ enum LocalPasteMain {
                "Return with no results must leave search editable without copying or closing")
         expect(controller.control(search, textView: emptyEditor, doCommandBy: #selector(NSResponder.cancelOperation(_:))),
                "Search must consume Escape to clear its query")
-        expect(search.stringValue.isEmpty && !descendants(controller.view).contains { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true },
-               "Clearing global search must restore the previously selected empty group")
+        expect(search.stringValue.isEmpty && descendants(controller.view).contains { $0.identifier?.rawValue == targetCardID },
+               "Clearing search must restore ordinary history including legacy grouped records")
         search.stringValue = "全局搜索目标"
         controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
         let imageTypeItem = NSMenuItem(title: "图片", action: NSSelectorFromString("selectType:"), keyEquivalent: "")
@@ -534,28 +534,58 @@ enum LocalPasteMain {
                descendants(controller.view).contains { $0.identifier?.rawValue == targetCardID },
                "Clearing type must preserve the query and restore matching content")
         window.makeFirstResponder(controller.view)
-        controller.view.keyDown(with: key(124, modifiers: .command))
-        expect(search.stringValue.isEmpty && descendants(controller.view).contains { $0.identifier?.rawValue == targetCardID },
-               "Command-right must select the next group and dismiss global search")
-        let nextMenu = controller.makeSettingsMenu().items.first { $0.title == "切换分组" }!.submenu!
-        expect(nextMenu.items.first { $0.state == .on }?.representedObject as? UUID == otherBoard.id,
-               "Group shortcuts must actually change the selected group")
-        controller.view.keyDown(with: key(123, modifiers: .command))
-        expect(!descendants(controller.view).contains { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true },
-               "Command-left must return to the previous empty group")
-        NSApp.sendAction(allItem.action!, to: allItem.target, from: allItem)
-        controller.view.keyDown(with: key(123, modifiers: .command))
-        expect(controller.makeSettingsMenu().items.first { $0.title == "切换分组" }!.submenu!.items.last!.state == .on,
-               "Command-left from history must wrap to the last group")
+        expect(!controller.view.performKeyEquivalent(with: key(124, modifiers: .command)) && search.stringValue == "全局搜索目标",
+               "Removed group shortcuts must not intercept keys or clear the current search")
         NSApp.sendAction(imageTypeItem.action!, to: controller, from: imageTypeItem)
-        window.makeFirstResponder(controller.view)
-        controller.view.keyDown(with: key(124, modifiers: .command))
-        expect(!chip.isHidden && chip.title == "图片 ×", "Group switching must preserve type filters")
+        expect(!controller.view.performKeyEquivalent(with: key(123, modifiers: .command)) && !chip.isHidden,
+               "Removed group shortcuts must not change active filters")
         chip.performClick(nil)
+        let segmented = descendants(controller.view).compactMap { $0 as? NSSegmentedControl }.first!
+        expect(segmented.segmentCount == 5 && segmented.isSelected(forSegment: 0),
+               "The type segmented control must expose five types with all types selected by default")
+        expect((0..<5).map { segmented.label(forSegment: $0) ?? "" } == ["全部类型", "文字", "链接", "图片", "文件"] && segmented.menu == nil,
+               "All five types must be labeled directly on the toolbar without a popup menu")
+        for tag in 1...4 {
+            segmented.setSelected(true, forSegment: tag)
+            NSApp.sendAction(segmented.action!, to: segmented.target, from: segmented)
+            expect(segmented.isSelected(forSegment: tag) && search.stringValue == "全局搜索目标",
+                   "Selecting a type via the segmented control must preserve the search query: tag \(tag)")
+            expect(!chip.isHidden, "The bottom clear chip must sync with the top segmented control: tag \(tag)")
+        }
+        segmented.setSelected(true, forSegment: 0)
+        NSApp.sendAction(segmented.action!, to: segmented.target, from: segmented)
+        expect(segmented.isSelected(forSegment: 0) && chip.isHidden &&
+               descendants(controller.view).contains { $0.identifier?.rawValue == targetCardID },
+               "All types must clear the type filter while preserving the search query")
+        store.recordText("https://example.com/", source: "Safari")
+        let linkID = store.entries[0].id
+        let imageID = store.entries.first { $0.kind == .image }!.id
+        let fileID = store.entries.first { $0.kind == .files }!.id
+        search.stringValue = ""
+        controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
+        let expected: [Set<UUID>] = [Set(store.entries.map(\.id)), [target.id], [linkID], [imageID], [fileID]]
+        for tag in 0..<5 {
+            segmented.selectedSegment = tag
+            expect(NSApp.sendAction(segmented.action!, to: segmented.target, from: segmented), "Every visible type must invoke filtering")
+            let actual = Set(descendants(controller.view).compactMap { view -> UUID? in
+                guard let raw = view.identifier?.rawValue, raw.hasPrefix("clipboard-card-") else { return nil }
+                return UUID(uuidString: String(raw.dropFirst("clipboard-card-".count)))
+            })
+            expect(actual == expected[tag] && (0..<5).filter { segmented.isSelected(forSegment: $0) } == [tag],
+                   "Each visible type must show exactly its own records and a single selection: \(tag)")
+        }
+        chip.performClick(nil)
+        expect(segmented.selectedSegment == 0, "Clearing the bottom chip must select all types on the toolbar")
+        segmented.selectedSegment = 3
+        NSApp.sendAction(segmented.action!, to: segmented.target, from: segmented)
+        controller.prepareForPresentation(resettingSelection: true)
+        expect(segmented.selectedSegment == 0 && chip.isHidden, "Reopening must reset both filtering controls")
+        search.stringValue = "全局搜索目标"
+        controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
         let nativeButton = descendants(controller.view).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "clipboard-settings" }!
         window.makeFirstResponder(nativeButton)
         expect(!controller.view.performKeyEquivalent(with: key(124, modifiers: .command)),
-               "Group shortcuts must not override native button focus")
+               "Command-arrow must not override native button focus")
         let pinnedCard = descendants(controller.view).first { $0.identifier?.rawValue == targetCardID }!
         let unpinAction = pinnedCard.accessibilityCustomActions()!.first { $0.name == "取消固定" }!
         expect(NSApp.sendAction(unpinAction.selector!, to: unpinAction.target, from: unpinAction) &&
@@ -563,10 +593,13 @@ enum LocalPasteMain {
                "The accessibility pin action must cancel a pin without a visible button")
         controller.prepareForPresentation()
         let unpinnedCard = descendants(controller.view).first { $0.identifier?.rawValue == targetCardID }!
-        let pinItem = unpinnedCard.menu!.items.first { ($0.representedObject as? ClipboardBoard)?.id == otherBoard.id }!
+        let pinItem = unpinnedCard.menu!.items.first { $0.title == "固定记录" }!
         expect(NSApp.sendAction(pinItem.action!, to: pinItem.target, from: pinItem) &&
-               store.entries.first { $0.id == target.id }?.boardID == otherBoard.id,
-               "The context menu must still pin to the chosen group")
+               store.entries.first { $0.id == target.id }?.isPinned == true &&
+               store.entries.first { $0.id == target.id }?.boardID == nil,
+               "The context menu must pin a record independently of legacy groups")
+        expect(!unpinnedCard.menu!.items.contains { $0.representedObject is ClipboardBoard },
+               "Card menus must not offer any legacy group destinations")
         controller.prepareForPresentation()
         let copiedCard = descendants(controller.view).first { $0.identifier?.rawValue == targetCardID }!
         expect(copiedCard.accessibilityLabel()?.contains("已固定") == true,
@@ -588,7 +621,7 @@ enum LocalPasteMain {
         search.stringValue = ""
         controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
         expect(status.isHidden && status.stringValue.isEmpty, "Normal browsing must not show persistent footer hints")
-        print("LocalPaste interaction self-test passed: first/second Return, Tab, global search and group restoration, clearable filters, group shortcuts, source labels, native editing, preview and size presets")
+        print("LocalPaste interaction self-test passed: first/second Return, Tab, search, clearable filters, legacy record access, simple pins, source labels, native editing, preview and size presets")
     }
 
     @MainActor
@@ -638,10 +671,6 @@ enum LocalPasteMain {
         controller.prepareForPresentation(resettingSelection: false)
         expect(cardCount() == 6, "All six entries must be visible initially")
 
-        let groupMenu = controller.makeSettingsMenu().items.first { $0.title == "切换分组" }!.submenu!
-        let groupItem = groupMenu.items.first { ($0.representedObject as? UUID) == pinnedBoard.id }!
-        NSApp.sendAction(groupItem.action!, to: groupItem.target, from: groupItem)
-        expect(cardCount() == 1, "Pinned group must show only its card")
         search.stringValue = "第"
         controller.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
         expect(cardCount() == 6, "Global search must match all entries")
@@ -685,8 +714,8 @@ enum LocalPasteMain {
         let newestCard = descendants(controller.view).first { $0.identifier?.rawValue == "clipboard-card-\(store.entries[0].id)" }!
         expect((newestCard.accessibilityValue() as? String)?.hasPrefix("已选中") == true,
                "The newest card must be visibly selected when reopening")
-        expect(controller.makeSettingsMenu().items.first { $0.title == "切换分组" }!.submenu!.items[0].state == .on,
-               "Reopening must return from the pinned group to all clipboard history")
+        expect(!controller.makeSettingsMenu().items.contains { $0.title.contains("分组") },
+               "Reopening must not recreate legacy group controls")
         RunLoop.current.run(until: Date().addingTimeInterval(0.3))
         expect(historyScroll.contentView.bounds.origin.x == 0 && window.firstResponder === controller.view,
                "Old scroll animations and queued refreshes must not undo the reset after opening")
