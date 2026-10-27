@@ -390,7 +390,7 @@ enum LocalPasteMain {
                              charactersIgnoringModifiers: text, isARepeat: false, keyCode: code)!
         }
         controller.focusInput()
-        expect(window.firstResponder === controller.view, "Opening an empty search must allow card arrow keys and Space")
+        expect(window.firstResponder === controller.view, "Opening an empty search must allow card arrow keys")
         controller.view.keyDown(with: key(0, text: "a"))
         expect(search.currentEditor()?.string == "a", "Typing from cards must hand the initiating key to the native search editor")
         search.stringValue = ""
@@ -415,8 +415,14 @@ enum LocalPasteMain {
                window.firstResponder === controller.view && search.stringValue == "完整预览",
                "Down must move focus to matching cards while preserving the search query")
         controller.view.keyDown(with: key(49, text: " "))
+        expect(window.childWindows?.isEmpty != false && window.firstResponder === controller.view && search.stringValue == "完整预览",
+               "Space in the card area must not open a preview or change search and focus")
+        let selectedCard = descendants(controller.view).first { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true }!
+        let selectedPreviewItem = selectedCard.menu!.items.first { $0.action == NSSelectorFromString("previewEntry") }!
+        expect(NSApp.sendAction(selectedPreviewItem.action!, to: selectedPreviewItem.target, from: selectedPreviewItem),
+               "The context menu must still open the preview")
         let preview = window.childWindows!.first!
-        expect(preview.identifier?.rawValue == "clipboard-content-preview", "Space must open a child preview")
+        expect(preview.identifier?.rawValue == "clipboard-content-preview", "The context menu must open a child preview")
         preview.contentView?.layoutSubtreeIfNeeded()
         let textView = descendants(preview.contentView!).compactMap { $0 as? NSTextView }.first!
         expect(textView.string == fullText && !textView.isEditable && textView.isSelectable,

@@ -245,7 +245,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         case 48: view.window?.makeFirstResponder(searchField)
         case 123, 126: moveSelection(-1)
         case 124, 125: moveSelection(1)
-        case 49: showPreview()
+        case 49: return true
         default:
             guard !event.modifierFlags.contains(.command), !event.modifierFlags.contains(.control),
                   let text = event.characters, text.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }),
@@ -656,7 +656,7 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         addItem(menu, "清空历史…", #selector(confirmClear))
         let helpItem = menu.addItem(withTitle: "使用帮助", action: nil, keyEquivalent: "")
         let helpMenu = NSMenu(title: "使用帮助")
-        for hint in ["⌘⇧V 呼出或关闭面板", "点击卡片复制 · 空格预览", "⌘F 搜索 · 回车选中结果，再回车复制",
+        for hint in ["⌘⇧V 呼出或关闭面板", "点击卡片复制 · 右键预览", "⌘F 搜索 · 回车选中结果，再回车复制",
                      "方向键选择记录", "右键卡片可预览、固定与删除", "Esc 依次关闭预览、搜索、面板"] {
             helpMenu.addItem(withTitle: hint, action: nil, keyEquivalent: "").isEnabled = false
         }
@@ -884,11 +884,11 @@ private final class ClipboardShelfCard: NSView {
         layer?.shadowColor = NSColor.black.cgColor
         layer?.shadowOffset = NSSize(width: 0, height: -2)
         let sourcePrefix = entry.sourceApplication.map { "来自 \($0) · " } ?? ""
-        toolTip = "\(sourcePrefix)点击复制 · 空格预览 · 右键可预览、固定或删除"
+        toolTip = "\(sourcePrefix)点击复制 · 右键可预览、固定或删除"
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         let sourceSuffix = entry.sourceApplication.map { "，来自 \($0)" } ?? ""
-        setAccessibilityLabel("\(entry.typeName)\(sourceSuffix)\(entry.isPinned ? "，已固定" : "")，\(String(entry.preview.prefix(120)))，点击复制，空格预览")
+        setAccessibilityLabel("\(entry.typeName)\(sourceSuffix)\(entry.isPinned ? "，已固定" : "")，\(String(entry.preview.prefix(120)))，点击复制")
         buildContent()
         buildMenu()
         updateColors(animated: false)
