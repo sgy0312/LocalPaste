@@ -6,6 +6,13 @@ enum ShelfGlass {
 
     static let panelMaterial: NSVisualEffectView.Material = .underWindowBackground
 
+    /// macOS 26 replaced the visual-effect blurs with the Liquid Glass surface.
+    /// Older systems keep the vibrancy material.
+    static var supportsSystemGlass: Bool {
+        if #available(macOS 26.0, *) { return true }
+        return false
+    }
+
     static func isDark(_ appearance: NSAppearance) -> Bool {
         appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
     }
@@ -77,26 +84,48 @@ enum ShelfGlass {
 }
 
 /// One native blur surface for each window, with live accessibility fallbacks.
+///
+/// The surface is hosted as a child view instead of subclassing `NSVisualEffectView`, so the
+/// Liquid Glass implementation can be swapped in without changing call sites: content stays above
+/// the glass because it is added to this container rather than to the effect view.
 @MainActor
-class ShelfGlassBackground: NSVisualEffectView {
+class ShelfGlassBackground: NSView {
     var isPreview = false {
         didSet {
             previewBackdrop.isHidden = !isPreview
             previewBackdrop.needsDisplay = true
         }
     }
-    var glassCornerRadius: CGFloat = 0
+
+    /// Kept for the call sites and self-tests that describe the vibrancy fallback.
+    var material: NSVisualEffectView.Material = ShelfGlass.panelMaterial
+    var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
+    var maskImage: NSImage? {
+        didSet { applyMaskImage() }
+    }
+
+    var glassCornerRadius: CGFloat = 0 {
+        didSet { applyCornerRadius() }
+    }
+
+    /// True when the surface is backed by the system glass effect rather than the legacy vibrancy.
+    var usesSystemGlass: Bool {
+        if #available(macOS 26.0, *) { return glassSurface is NSGlassEffectView }
+        return false
+    }
+
+    private var glassSurface: NSView?
+    private var fallbackEffect: NSVisualEffectView?
     private var displayObserver: NSObjectProtocol?
     private let previewBackdrop = ShelfGlassPreviewBackdrop()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        blendingMode = .behindWindow
-        state = .active
         previewBackdrop.frame = bounds
         previewBackdrop.autoresizingMask = [.width, .height]
         previewBackdrop.isHidden = true
+        buildGlassSurface()
         addSubview(previewBackdrop)
         updateGlass()
         displayObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -122,28 +151,84 @@ class ShelfGlassBackground: NSVisualEffectView {
         updateGlass()
     }
 
+    override func layout() {
+        super.layout()
+        previewBackdrop.frame = bounds
+        applyMaskImage()
+    }
+
+    private func buildGlassSurface() {
+        let surface: NSView
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.style = .regular
+            surface = glass
+        } else {
+            let effect = NSVisualEffectView()
+            effect.material = material
+            effect.blendingMode = blendingMode
+            effect.state = .active
+            fallbackEffect = effect
+            surface = effect
+        }
+        surface.frame = bounds
+        surface.autoresizingMask = [.width, .height]
+        surface.wantsLayer = true
+        glassSurface = surface
+        addSubview(surface, positioned: .below, relativeTo: nil)
+    }
+
     func updateGlass() {
-        material = ShelfGlass.panelMaterial
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = (ShelfGlass.reduceTransparency ? NSColor.windowBackgroundColor : .clear).cgColor
+            if ShelfGlass.reduceTransparency {
+                glassSurface?.isHidden = true
+                layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            } else {
+                glassSurface?.isHidden = false
+                layer?.backgroundColor = NSColor.clear.cgColor
+            }
+            fallbackEffect?.material = material
+            fallbackEffect?.blendingMode = blendingMode
+            fallbackEffect?.state = .active
             layer?.borderColor = ShelfGlass.panelBorder().cgColor
         }
+        applyCornerRadius()
+        applyMaskImage()
         previewBackdrop.needsDisplay = true
         needsDisplay = true
     }
 
+    private func applyCornerRadius() {
+        if #available(macOS 26.0, *), let glass = glassSurface as? NSGlassEffectView {
+            glass.cornerRadius = glassCornerRadius > 0 ? glassCornerRadius : ShelfGlassSurfaceDefaults.cornerRadius
+            return
+        }
+        glassSurface?.layer?.cornerRadius = glassCornerRadius
+        glassSurface?.layer?.masksToBounds = glassCornerRadius > 0
+    }
+
+    /// Mirrors `NSVisualEffectView.maskImage` on the vibrancy fallback. The glass surface carries its
+    /// own corner radius, so masking it again would double-clip the rendered material.
+    private func applyMaskImage() {
+        guard let fallbackEffect else { return }
+        fallbackEffect.maskImage = maskImage
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        guard ShelfGlass.reduceTransparency else { return }
         NSGraphicsContext.saveGraphicsState()
         defer { NSGraphicsContext.restoreGraphicsState() }
         if glassCornerRadius > 0 {
             NSBezierPath(roundedRect: bounds, xRadius: glassCornerRadius, yRadius: glassCornerRadius).addClip()
         }
-        if ShelfGlass.reduceTransparency {
-            NSColor.windowBackgroundColor.setFill()
-            bounds.fill()
-        }
+        NSColor.windowBackgroundColor.setFill()
+        bounds.fill()
     }
+}
+
+private enum ShelfGlassSurfaceDefaults {
+    static let cornerRadius: CGFloat = 28
 }
 
 private final class ShelfGlassPreviewBackdrop: NSView {

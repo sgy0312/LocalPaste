@@ -113,7 +113,6 @@ final class ClipboardShelfController: NSViewController, NSSearchFieldDelegate {
         root.glassCornerRadius = ShelfGeometry.panelRadius
         root.material = ShelfGlass.panelMaterial
         root.blendingMode = .behindWindow
-        root.state = .active
         root.wantsLayer = true
         root.layer?.cornerRadius = ShelfGeometry.panelRadius
         root.layer?.cornerCurve = .circular

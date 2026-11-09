@@ -200,7 +200,7 @@ enum LocalPasteMain {
                    "Choosing a menu item must update retention")
         }
         store.setRetention(.oneDay)
-        let backdrop = controller.view as! NSVisualEffectView
+        let backdrop = controller.view as! ShelfGlassBackground
         let mask = backdrop.maskImage!
         let maskBitmap = NSBitmapImageRep(data: mask.tiffRepresentation!)!
         for point in [(0, 0), (maskBitmap.pixelsWide - 1, 0), (0, maskBitmap.pixelsHigh - 1),
@@ -212,7 +212,9 @@ enum LocalPasteMain {
                mask.capInsets.top > 0 && mask.resizingMode == .stretch,
                "The material mask must be opaque inside and stretch without stretching the rounded corners")
         expect(backdrop.material == ShelfGlass.panelMaterial && backdrop.blendingMode == .behindWindow,
-               "The shelf must use a native material that samples behind its window")
+               "The shelf must request the behind-window vibrancy material as its fallback surface")
+        expect(backdrop.usesSystemGlass == ShelfGlass.supportsSystemGlass,
+               "The shelf must use Liquid Glass on systems that provide it and vibrancy everywhere else")
         let glassCard = descendants(controller.view).first { $0.identifier?.rawValue.hasPrefix("clipboard-card-") == true }!
         let glassFrame = backdrop.frame
         backdrop.layer?.borderColor = NSColor.clear.cgColor
